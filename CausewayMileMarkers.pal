@@ -1,0 +1,100 @@
+; Causeway Mile Markers
+; Craeted 7/29/20
+
+
+Title: Causeway Mile Markers
+Threshold: 999
+Color: 255 255 255
+;Refresh: 001
+
+;MM 1
+IconFile: 1, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot1.png
+Icon: 30.0362, -90.1515,0,1,1, MM 1
+
+;MM 2
+IconFile: 2, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot2.png
+Icon: 30.0504, -90.1490,0,2,1, MM 2
+
+;MM 3
+IconFile: 3, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot3.png
+Icon: 30.0647, -90.1465,0,3,1, MM 3
+
+;MM 4
+IconFile: 4, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot4.png
+Icon: 30.0794, -90.1440,0,4,1, MM 4
+
+;MM 5
+IconFile: 5, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot5.png
+Icon: 30.0938, -90.1414,0,5,1, MM 5
+
+;MM 6
+IconFile: 6, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot6.png
+Icon: 30.1080, -90.1389,0,6,1, MM 6
+
+;MM 7
+IconFile: 7, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot7.png
+Icon: 30.1223, -90.1364,0,7,1, MM 7
+
+;MM 8
+IconFile: 8, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot8.png
+Icon: 30.1367, -90.1339,0,8,1, MM 8 - Draw Bridge South (1)
+
+;MM 9
+IconFile: 9, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot9.png
+Icon: 30.1511, -90.1314,0,9,1, MM 9
+
+;MM 10
+IconFile: 10, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot10.png
+Icon: 30.1653, -90.1289,0,10,1, MM 10
+
+;MM 11
+IconFile: 11, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot11.png
+Icon: 30.1797, -90.1264,0,11,1, MM 11
+
+;MM 12
+IconFile: 12, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot12.png
+Icon: 30.1939, -90.1238,0,12,1, MM 12
+
+;MM 13
+IconFile: 13, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot13.png
+Icon: 30.2082, -90.1214,0,13,1, MM 13
+
+;MM 14
+IconFile: 14, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot14.png
+Icon: 30.2225, -90.1188,0,14,1, MM 14
+
+;MM 15
+IconFile: 15, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot15.png
+Icon: 30.2368, -90.1163,0,15,1, MM 15
+
+;MM 16
+IconFile: 16, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot16.png
+Icon: 30.2511, -90.1138,0,16,1, MM 16 - Draw Bridge North (2)
+
+;MM 17
+IconFile: 17, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot17.png
+Icon: 30.2654, -90.1113,0,17,1, MM 17
+
+;MM 18
+IconFile: 18, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot18.png
+Icon: 30.2802, -90.1087,0,18,1, MM 18
+
+;MM 19
+IconFile: 19, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot19.png
+Icon: 30.2945, -90.1061,0,19,1, MM 19
+
+;MM 20
+IconFile: 20, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot20.png
+Icon: 30.3088, -90.1036,0,20,1, MM 20
+
+;MM 21
+IconFile: 21, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot21.png
+Icon: 30.3230, -90.1011,0,21,1, MM 21
+
+;MM 22
+IconFile: 22, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot22.png
+Icon: 30.3373, -90.0986,0,22,1, MM 22
+
+;MM 23
+IconFile: 23, 12, 12, 12, 12, L:\Operations\Radar\GRstuff\Places\Causeway\dot23.png
+Icon: 30.3517, -90.0961,0,23,1, MM 23
