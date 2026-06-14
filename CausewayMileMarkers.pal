@@ -8,7 +8,7 @@ Color: 255 255 255
 ;Refresh: 001
 
 ;MM 1
-IconFile: 1, 12, 12, 12, 12, https://raw.githubusercontent.com/RED112482/GRStuff/main/icons/dot1.png
+IconFile: 1, 12, 12, 12, 12, https://github.com/RED112482/GRStuff/blob/main/icons/dot1.png
 Icon: 30.0362, -90.1515,0,1,1, MM 1
 
 ;MM 2
