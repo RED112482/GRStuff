@@ -10,3 +10,8 @@ Color: 255 255 255
 ;MM 1
 IconFile: 1, 12, 12, 12, 12, https://github.com/RED112482/GRStuff/blob/main/icons/dot1.png?raw=true
 Icon: 30.0362, -90.1515,0,1,1, MM 1
+
+;MM 2
+IconFile: 2, 12, 12, 12, 12, https://github.com/RED112482/GRStuff/blob/main/icons/dot2.png?raw=true
+Icon: 30.0504, -90.1490,0,2,1, MM 2
+
