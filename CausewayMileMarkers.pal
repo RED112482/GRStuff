@@ -5,7 +5,7 @@
 Title: Causeway Mile Markers
 Threshold: 999
 Color: 255 255 255
-;Refresh: 001
+Refresh: 001
 
 ;MM 1
 IconFile: 1, 12, 12, 12, 12, https://github.com/RED112482/GRStuff/blob/main/icons/dot1.png?raw=true
