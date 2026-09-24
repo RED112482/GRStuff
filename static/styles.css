@@ -1,0 +1,57 @@
+:root{
+  color-scheme:dark;
+  --bg:#06080d;
+  --panel:#0c1119;
+  --panel2:#101722;
+  --line:#222c3a;
+  --text:#f3f6fa;
+  --muted:#8d99aa;
+  --accent:#4ea1ff;
+  --good:#35d07f;
+  --bad:#ff5b69;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Poppins,system-ui,sans-serif}
+button,select{font:inherit}
+.topbar{display:flex;justify-content:space-between;gap:24px;align-items:center;padding:18px 24px;border-bottom:1px solid var(--line);background:#080c12}
+.eyebrow{font-size:11px;letter-spacing:.16em;color:#6f7f94;font-weight:700}
+h1,h2{margin:2px 0 0}
+h1{font-size:24px} h2{font-size:20px}
+.status-wrap{display:flex;align-items:center;gap:10px}
+.status-dot{width:11px;height:11px;border-radius:50%;background:#6f7f94;box-shadow:0 0 0 4px rgba(255,255,255,.04)}
+.status-dot.ok{background:var(--good)} .status-dot.bad{background:var(--bad)}
+.status-text{font-weight:600;font-size:14px}.status-sub{font-size:12px;color:var(--muted)}
+.layout{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(340px,.75fr);gap:16px;padding:16px}
+.viewer-panel,.analysis-panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:end;padding:14px;border-bottom:1px solid var(--line)}
+.toolbar label{display:grid;gap:5px;font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.08em}
+select,button{min-height:40px;border:1px solid #2a3546;background:#101722;color:var(--text);border-radius:9px;padding:8px 11px}
+button{cursor:pointer;font-weight:600}button:hover{border-color:#3b82c4}
+.radar-shell{padding:14px}
+.radar-stage{position:relative;aspect-ratio:1/1;max-width:900px;margin:auto;background:#090d14;overflow:hidden;border-radius:10px;border:1px solid #1d2633;cursor:crosshair}
+.radar-stage img{width:100%;height:100%;display:block;object-fit:fill}
+.overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.rings circle,.rings line{fill:none;stroke:rgba(255,255,255,.16);stroke-width:1}
+.cursor-marker circle,.cursor-marker line{fill:none;stroke:white;stroke-width:2}
+.radar-label,.radar-center{position:absolute;font-size:10px;color:rgba(255,255,255,.72);font-weight:600;pointer-events:none}
+.north{top:8px;left:50%;transform:translateX(-50%)}.south{bottom:8px;left:50%;transform:translateX(-50%)}
+.east{right:8px;top:50%;transform:translateY(-50%)}.west{left:8px;top:50%;transform:translateY(-50%)}
+.radar-center{left:50%;top:50%;transform:translate(-50%,-50%);padding:2px 5px;background:rgba(0,0,0,.55);border-radius:4px}
+.footer-strip{display:flex;flex-wrap:wrap;gap:18px;padding:11px 14px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+.analysis-panel{padding:16px}
+.analysis-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:16px}
+.point-badge{font-size:11px;padding:6px 8px;border:1px solid #2b3747;border-radius:999px;color:var(--muted);white-space:nowrap}
+.empty-state{padding:18px;border:1px dashed #2b3747;border-radius:10px;color:var(--muted);font-size:13px;line-height:1.55}
+.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.metric-grid>div{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:10px}
+.metric-grid span{display:block;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.metric-grid strong{font-size:14px}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:9px;max-height:650px}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th,td{padding:8px;border-bottom:1px solid #1d2633;text-align:right;white-space:nowrap}
+th{position:sticky;top:0;background:#101722;color:#91a0b4;font-weight:600}
+th:first-child,td:first-child{text-align:left}
+tr:last-child td{border-bottom:0}
+.toast{position:fixed;right:18px;bottom:18px;background:#111927;border:1px solid #2a3546;border-radius:9px;padding:10px 12px;font-size:12px;max-width:360px}
+.hidden{display:none!important}
+@media(max-width:980px){.layout{grid-template-columns:1fr}.analysis-panel{min-height:300px}}
+@media(max-width:600px){.topbar{align-items:flex-start;flex-direction:column}.layout{padding:8px}.toolbar{padding:10px}.analysis-head{flex-direction:column}.metric-grid{grid-template-columns:1fr 1fr 1fr}}
