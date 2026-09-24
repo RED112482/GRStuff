@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KMOB Level-II Volume Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">NEXRAD LEVEL-II / PROTOTYPE</div>
+      <h1>KMOB Volume Explorer</h1>
+    </div>
+    <div class="status-wrap">
+      <span id="statusDot" class="status-dot"></span>
+      <div>
+        <div id="statusText" class="status-text">Connecting…</div>
+        <div id="volumeTime" class="status-sub">Waiting for volume metadata</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="viewer-panel">
+      <div class="toolbar">
+        <label>
+          Product
+          <select id="fieldSelect"></select>
+        </label>
+        <label>
+          Elevation
+          <select id="sweepSelect"></select>
+        </label>
+        <label>
+          Range
+          <select id="rangeSelect">
+            <option value="75">75 km</option>
+            <option value="100">100 km</option>
+            <option value="150" selected>150 km</option>
+            <option value="200">200 km</option>
+            <option value="300">300 km</option>
+          </select>
+        </label>
+        <button id="refreshBtn" type="button">Refresh now</button>
+      </div>
+
+      <div class="radar-shell">
+        <div id="radarStage" class="radar-stage" aria-label="Interactive radar display">
+          <img id="radarImage" alt="KMOB radar sweep">
+          <svg id="overlay" class="overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">
+            <g class="rings">
+              <circle cx="500" cy="500" r="125"></circle>
+              <circle cx="500" cy="500" r="250"></circle>
+              <circle cx="500" cy="500" r="375"></circle>
+              <circle cx="500" cy="500" r="499"></circle>
+              <line x1="500" y1="0" x2="500" y2="1000"></line>
+              <line x1="0" y1="500" x2="1000" y2="500"></line>
+            </g>
+            <g id="cursorMarker" class="cursor-marker hidden">
+              <circle cx="500" cy="500" r="9"></circle>
+              <line x1="480" y1="500" x2="520" y2="500"></line>
+              <line x1="500" y1="480" x2="500" y2="520"></line>
+            </g>
+          </svg>
+          <div class="radar-label north">N</div>
+          <div class="radar-label south">S</div>
+          <div class="radar-label east">E</div>
+          <div class="radar-label west">W</div>
+          <div class="radar-center">KMOB</div>
+        </div>
+      </div>
+
+      <div class="footer-strip">
+        <span id="productLabel">—</span>
+        <span id="sweepLabel">—</span>
+        <span id="cursorReadout">Click the radar to inspect the column</span>
+      </div>
+    </section>
+
+    <aside class="analysis-panel">
+      <div class="analysis-head">
+        <div>
+          <div class="eyebrow">ALL-TILT ANALYSIS</div>
+          <h2>Vertical Inspector</h2>
+        </div>
+        <span id="pointBadge" class="point-badge">No point selected</span>
+      </div>
+
+      <div id="emptyState" class="empty-state">
+        Click anywhere in the PPI. The prototype will sample the nearest gate at that azimuth/range through every KMOB elevation angle.
+      </div>
+
+      <div id="analysisContent" class="hidden">
+        <div class="metric-grid">
+          <div><span>Azimuth</span><strong id="azValue">—</strong></div>
+          <div><span>Range</span><strong id="rangeValue">—</strong></div>
+          <div><span>Tilts</span><strong id="tiltCount">—</strong></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Elev</th>
+                <th>Height</th>
+                <th>REF</th>
+                <th>VEL</th>
+                <th>ZDR</th>
+                <th>CC</th>
+              </tr>
+            </thead>
+            <tbody id="inspectorRows"></tbody>
+          </table>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
