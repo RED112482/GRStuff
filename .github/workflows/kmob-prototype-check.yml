@@ -1,0 +1,21 @@
+name: KMOB prototype syntax check
+
+on:
+  push:
+    branches: [kmob-level2-prototype]
+  pull_request:
+    paths:
+      - "app.py"
+      - "static/**"
+      - "requirements.txt"
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Python
+        run: python -m py_compile app.py
