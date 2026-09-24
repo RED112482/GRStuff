@@ -1,0 +1,11 @@
+name: kmob-radar
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - arm_pyart>=2.3,<2.4
+  - fastapi>=0.116,<1
+  - uvicorn>=0.35,<1
+  - boto3>=1.40,<2
+  - matplotlib>=3.10,<4
+  - numpy>=2,<3
