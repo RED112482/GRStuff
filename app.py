@@ -26,7 +26,7 @@ RADAR_ID = os.getenv("RADAR_ID", "KMOB").upper()
 BUCKET = os.getenv("NEXRAD_BUCKET", "unidata-nexrad-level2")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 DEFAULT_RANGE_KM = float(os.getenv("DEFAULT_RANGE_KM", "150"))
-RASTER_SIZE = int(os.getenv("RADAR_RASTER_SIZE", "720"))
+RASTER_SIZE = int(os.getenv("RADAR_RASTER_SIZE", "640"))
 CACHE_DIR = Path(os.getenv("RADAR_CACHE_DIR", Path(tempfile.gettempdir()) / "kmob-level2"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
