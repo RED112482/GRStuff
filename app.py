@@ -261,7 +261,7 @@ def _render_polar_png(radar, field: str, sweep: int, range_km: float, smooth: bo
     range_weight = np.clip(range_weight, 0.0, 1.0)
 
     az_ext = np.concatenate(([az_sorted[-1] - 360.0], az_sorted, [az_sorted[0] + 360.0]))
-    ray_ext = np.concatenate(([order[-1]], order, [order[0]])).astype(np.int32)
+    sorted_ray_indices = np.arange(len(az_sorted), dtype=np.int32)\n    ray_ext = np.concatenate(([sorted_ray_indices[-1]], sorted_ray_indices, [sorted_ray_indices[0]]))
     ray_hi_pos = np.searchsorted(az_ext, az, side="right")
     ray_hi_pos = np.clip(ray_hi_pos, 1, len(az_ext) - 1)
     ray_lo_pos = ray_hi_pos - 1
