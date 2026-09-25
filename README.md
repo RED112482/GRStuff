@@ -1,78 +1,91 @@
 # KMOB Level-II Volume Explorer — Prototype
 
-A first-pass interactive NEXRAD Level-II viewer/analysis prototype for **KMOB**.
+Interactive NEXRAD Level-II interrogation prototype for **KMOB**.
 
-## What this MVP does
+## Current rapid-interrogation build
 
-- Polls the public AWS `unidata-nexrad-level2` bucket for the newest completed KMOB Level-II volume.
-- Downloads and decodes the newest volume with Py-ART.
-- Displays selectable radar moments:
-  - Reflectivity
-  - Velocity
-  - ZDR
-  - Correlation Coefficient
-  - Differential Phase
-  - Spectrum Width
-- Lets you switch through all available elevation scans.
-- Click anywhere in the radar display to inspect that horizontal location through **every elevation angle**.
-- Builds a vertical table showing height and radar-moment values for each tilt.
-- Automatically checks AWS for a newer volume every 30 seconds.
+- Polls the public AWS `unidata-nexrad-level2` completed-volume bucket every **5 seconds** for a newer KMOB volume.
+- Limits S3 discovery to the most recent hours instead of repeatedly listing an entire day.
+- Uses a fast NumPy/Pillow polar rasterizer instead of rebuilding every PPI through Matplotlib.
+- Caches rendered sweeps and preloads the immediately adjacent tilts.
+- Supports rapid tilt stepping:
+  - **Up Arrow** = next higher tilt
+  - **Down Arrow** = next lower tilt
+  - Mouse wheel **up** over the radar = higher tilt
+  - Mouse wheel **down** over the radar = lower tilt
+  - Click a row in the Vertical Inspector to jump to that tilt
+- Large on-radar HUD displays:
+  - current elevation angle
+  - tilt number
+  - cursor azimuth/range
+  - approximate beam-center height in kft ARL
+- Clicking a point locks an all-tilt vertical inspection and uses Py-ART gate geometry for the exact beam-center height at that location.
+- Optional **2-D Smooth** mode performs bilinear interpolation between neighboring azimuth/range samples in the displayed sweep.
+- New volumes preserve the nearest current elevation and automatically refresh a locked interrogation point.
 
-## Important prototype limitation
+## Radar moments
 
-This first version uses the completed-volume Level-II bucket, not the Level-II **chunk** bucket. That is intentional so the ingest/analysis/display workflow can be validated first. The backend is separated from the UI so the next phase can replace the completed-volume poller with the chunk stream and update the analysis as individual elevations arrive.
+- Reflectivity
+- Velocity
+- ZDR
+- Correlation Coefficient
+- Differential Phase
+- Spectrum Width
 
-## Run locally
+## Windows setup
 
-Python 3.11 is recommended.
+The recommended environment is Conda/Miniconda with Python 3.11.
 
-```bash
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8000
+```powershell
+conda create -n kmob-radar --solver=libmamba --override-channels -c conda-forge python=3.11 arm_pyart pip -y
+conda activate kmob-radar
+python -m pip install fastapi "uvicorn[standard]" boto3
 ```
 
-Then open:
+Then launch from the project directory:
+
+```powershell
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+Open:
 
 ```
-http://localhost:8000
+http://127.0.0.1:8000
 ```
-
-No AWS credentials are required; the NOAA/Unidata NEXRAD bucket is public.
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `RADAR_ID` | `KMOB` | Radar ICAO ID |
-| `NEXRAD_BUCKET` | `unidata-nexrad-level2` | AWS bucket |
-| `POLL_SECONDS` | `30` | Frequency to check for new volumes |
+| `NEXRAD_BUCKET` | `unidata-nexrad-level2` | Completed-volume AWS bucket |
+| `POLL_SECONDS` | `5` | Frequency to check for a newer completed volume |
 | `DEFAULT_RANGE_KM` | `150` | Initial display radius |
+| `RADAR_RASTER_SIZE` | `640` | PPI raster dimensions; lower is faster |
 | `RADAR_CACHE_DIR` | OS temp directory | Download cache |
 
-## API
+## Current API
 
-- `GET /api/status` — ingest status
+- `GET /api/status` — ingest/freshness status
 - `POST /api/refresh` — force an AWS check
-- `GET /api/volume` — volume metadata, fields, and sweeps
-- `GET /api/image/{field}/{sweep}.png?range_km=150` — PPI image
-- `GET /api/inspect?x_km=...&y_km=...` — all-tilt vertical inspection at a selected point
+- `GET /api/volume` — current volume metadata, fields, and sweeps
+- `GET /api/image/{field}/{sweep}.png?range_km=150&smooth=true` — cached/interpolated PPI
+- `GET /api/inspect?x_km=...&y_km=...` — all-tilt vertical inspection
+
+## Important latency distinction
+
+This build is now much faster for **interrogating the volume already loaded**, but it still reads the AWS **completed-volume** Level-II source. A 5-second poll cannot make a not-yet-completed volume appear early.
+
+The next ingest phase is the real-time `unidata-nexrad-level2-chunks` source using Xradar's streaming NEXRAD reader. That source can expose incomplete/current sweeps while the radar is still collecting the volume, which is the path to true tilt-as-it-arrives operation.
 
 ## Next development targets
 
-1. Level-II chunk ingestion for tilt-by-tilt live updates.
-2. Interactive A→B vertical cross-sections.
-3. Time-height history for a selected point/storm.
-4. Derived echo-top and core-height products.
-5. ZDR/KDP/CC column analysis.
-6. Storm-centered 3-D cubes and isosurfaces.
+1. Xradar Level-II chunk ingestion with incomplete sweeps padded in real time.
+2. Current-scan progress display showing which tilt is actively arriving.
+3. A→B vertical cross-sections.
+4. Time-height history for a locked storm point.
+5. Derived echo-top/core-height products.
+6. ZDR/KDP/CC column analysis.
 7. Rotation-depth / azimuthal-shear analysis.
-
-## Hosting note
-
-GitHub can store/version this application, but GitHub Pages cannot execute the Python Level-II backend. The backend must run locally or on a Python-capable host/container. The included Dockerfile provides a portable starting point.
+8. Storm-centered 3-D volumes.
