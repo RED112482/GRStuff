@@ -12,7 +12,7 @@
 <body>
   <header class="topbar">
     <div>
-      <div class="eyebrow">NEXRAD LEVEL-II / PROTOTYPE</div>
+      <div class="eyebrow">NEXRAD LEVEL-II / RAPID INTERROGATION PROTOTYPE</div>
       <h1>KMOB Volume Explorer</h1>
     </div>
     <div class="status-wrap">
@@ -31,10 +31,16 @@
           Product
           <select id="fieldSelect"></select>
         </label>
-        <label>
-          Elevation
-          <select id="sweepSelect"></select>
-        </label>
+
+        <div class="tilt-stepper" aria-label="Tilt controls">
+          <button id="tiltDownBtn" type="button" title="Lower tilt (Down Arrow)">▼</button>
+          <label>
+            Elevation
+            <select id="sweepSelect"></select>
+          </label>
+          <button id="tiltUpBtn" type="button" title="Higher tilt (Up Arrow)">▲</button>
+        </div>
+
         <label>
           Range
           <select id="rangeSelect">
@@ -45,12 +51,30 @@
             <option value="300">300 km</option>
           </select>
         </label>
+
+        <label class="switch-label">
+          <input id="smoothToggle" type="checkbox" checked>
+          <span>2-D Smooth</span>
+        </label>
+
         <button id="refreshBtn" type="button">Refresh now</button>
       </div>
 
       <div class="radar-shell">
-        <div id="radarStage" class="radar-stage" aria-label="Interactive radar display">
+        <div id="radarStage" class="radar-stage" tabindex="0" aria-label="Interactive radar display. Use mouse wheel or up and down arrow keys to change tilts.">
           <img id="radarImage" alt="KMOB radar sweep">
+
+          <div class="tilt-hud">
+            <div class="tilt-hud-top">
+              <strong id="tiltDegree">—°</strong>
+              <span id="tiltPosition">Tilt —</span>
+            </div>
+            <div id="beamHeightHud" class="beam-height">Move cursor over radar for beam height</div>
+            <div id="cursorHud" class="cursor-hud">Wheel ↑ higher tilt · Wheel ↓ lower tilt</div>
+          </div>
+
+          <div class="nav-hint">↑ / ↓ or mouse wheel changes tilt</div>
+
           <svg id="overlay" class="overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">
             <g class="rings">
               <circle cx="500" cy="500" r="125"></circle>
@@ -66,6 +90,7 @@
               <line x1="500" y1="480" x2="500" y2="520"></line>
             </g>
           </svg>
+
           <div class="radar-label north">N</div>
           <div class="radar-label south">S</div>
           <div class="radar-label east">E</div>
@@ -77,7 +102,7 @@
       <div class="footer-strip">
         <span id="productLabel">—</span>
         <span id="sweepLabel">—</span>
-        <span id="cursorReadout">Click the radar to inspect the column</span>
+        <span id="cursorReadout">Move over radar for azimuth, range and beam height</span>
       </div>
     </section>
 
@@ -91,16 +116,18 @@
       </div>
 
       <div id="emptyState" class="empty-state">
-        Click anywhere in the PPI. The prototype will sample the nearest gate at that azimuth/range through every KMOB elevation angle.
+        Click anywhere in the PPI to lock a location. The table samples the nearest gate through every elevation. Click any table row to jump directly to that tilt.
       </div>
 
       <div id="analysisContent" class="hidden">
         <div class="metric-grid">
           <div><span>Azimuth</span><strong id="azValue">—</strong></div>
           <div><span>Range</span><strong id="rangeValue">—</strong></div>
-          <div><span>Tilts</span><strong id="tiltCount">—</strong></div>
+          <div><span>Current tilt</span><strong id="currentTiltValue">—</strong></div>
+          <div><span>Beam ARL</span><strong id="currentHeightValue">—</strong></div>
         </div>
 
+        <div class="table-note">Active tilt is highlighted · click a row to jump</div>
         <div class="table-wrap">
           <table>
             <thead>
