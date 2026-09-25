@@ -176,7 +176,7 @@ function prefetchSweep(sweep) {
 function prefetchNeighbors() {
   const pos = getSweepPosition();
   if (pos < 0) return;
-  for (const offset of [-1, 1, -2, 2]) {
+  for (const offset of [-1, 1]) {
     const neighbor = state.volume.sweeps[pos + offset];
     if (neighbor) prefetchSweep(neighbor.index);
   }
