@@ -1,22 +1,32 @@
 const state = {
-  volume: null,
+  slots: [],
+  selectedElevation: null,
   field: "reflectivity",
-  sweep: 0,
   rangeKm: 150,
   smooth: true,
+  scanHistory: [],
+  scanIndex: 0,
+  wallMode: false,
   point: null,
   hoverRangeKm: null,
   hoverAzimuth: null,
-  renderToken: 0,
-  lastStatus: null,
   wheelLocked: false,
-  frame: 0,
-  history: [],
-  maxFrame: 0,
-  wallMode: false,
   boundaries: null,
   boundariesLoading: false,
+  lastStatus: null,
+  scanSequence: [],
+  scanStatus: {},
+  lastLiveToken: null,
 };
+
+const FIELD_OPTIONS = [
+  ["reflectivity", "Reflectivity", "dBZ"],
+  ["velocity", "Velocity", "m/s"],
+  ["differential_reflectivity", "ZDR", "dB"],
+  ["cross_correlation_ratio", "CC", ""],
+  ["differential_phase", "PhiDP", "deg"],
+  ["spectrum_width", "Spectrum Width", "m/s"],
+];
 
 const el = (id) => document.getElementById(id);
 const fieldSelect = el("fieldSelect");
@@ -47,18 +57,19 @@ async function json(url, options) {
 function fmtUtc(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
   return d.toISOString().slice(11, 19) + "Z";
 }
 
-function humanAge(seconds) {
-  if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds))) {
-    return "age unknown";
-  }
-  const sec = Math.max(0, Math.round(Number(seconds)));
-  if (sec < 60) return sec + "s old";
-  const min = Math.floor(sec / 60);
-  const rem = sec % 60;
-  return min + "m " + rem + "s old";
+function currentScan() {
+  return state.scanHistory[state.scanIndex] || null;
+}
+
+function selectedSlot() {
+  if (state.selectedElevation === null) return null;
+  return state.slots.find(
+    (slot) => Math.abs(Number(slot.elevation) - Number(state.selectedElevation)) <= 0.06
+  ) || null;
 }
 
 function setLiveBadge(mode, text) {
@@ -68,184 +79,298 @@ function setLiveBadge(mode, text) {
   el("liveText").textContent = text;
 }
 
-function currentFrameMeta() {
-  return state.history.find((item) => item.frame === state.frame) || null;
+function populateFields() {
+  fieldSelect.innerHTML = "";
+  for (const [id, label] of FIELD_OPTIONS) {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = label;
+    fieldSelect.appendChild(option);
+  }
+  fieldSelect.value = state.field;
 }
 
-function updateTimeUI() {
-  const meta = currentFrameMeta();
-  el("timePastBtn").disabled = state.frame >= state.maxFrame;
-  el("timeFutureBtn").disabled = state.frame <= 0;
-  el("goLiveBtn").classList.toggle("active", state.frame === 0);
+function fillElevationSelect() {
+  const prior = state.selectedElevation;
+  sweepSelect.innerHTML = "";
 
-  if (state.frame === 0) {
-    el("timeLabel").textContent = state.volume?.source === "live" ? "LIVE" : "LATEST";
-  } else {
-    el("timeLabel").textContent = "-" + state.frame + " VOL";
+  state.slots.forEach((slot, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    const scan = slot.latest;
+    let suffix = "";
+    if (scan) {
+      if (scan.source === "live") {
+        suffix = scan.kind === "BASE" ? " · LIVE" : ` · ${scan.kind} #${scan.sequence_number}`;
+      } else {
+        suffix = ` · last available -${scan.volume_offset} vol`;
+      }
+    } else {
+      suffix = " · unavailable";
+    }
+    option.textContent = Number(slot.elevation).toFixed(2) + "°" + suffix;
+    sweepSelect.appendChild(option);
+  });
+
+  if (!state.slots.length) {
+    state.selectedElevation = null;
+    return;
   }
 
-  el("timeStamp").textContent = fmtUtc(state.volume?.volume_time || meta?.volume_time);
+  let selectedIndex = 0;
+  if (prior !== null) {
+    let best = Infinity;
+    state.slots.forEach((slot, index) => {
+      const delta = Math.abs(Number(slot.elevation) - Number(prior));
+      if (delta < best) {
+        best = delta;
+        selectedIndex = index;
+      }
+    });
+  }
+
+  state.selectedElevation = Number(state.slots[selectedIndex].elevation);
+  sweepSelect.value = String(selectedIndex);
+}
+
+function scanUrl(scan, size = 640) {
+  if (!scan) return "";
+  const params = new URLSearchParams({
+    source: scan.source,
+    sequence_index: String(scan.sequence_index),
+    range_km: String(state.rangeKm),
+    smooth: state.smooth ? "true" : "false",
+    size: String(size),
+  });
+  if (scan.archive_key) params.set("archive_key", scan.archive_key);
+  return `/api/scan-image/${encodeURIComponent(state.field)}.png?${params.toString()}`;
+}
+
+function scanAgeLabel(scan) {
+  if (!scan) return "NO SCAN";
+  if (scan.source === "live") {
+    if (scan.kind === "BASE") return "LIVE";
+    return `${scan.kind} #${scan.sequence_number}`;
+  }
+  if (scan.volume_offset === 1) return "PREV VOL";
+  return `-${scan.volume_offset} VOL`;
 }
 
 function updateStatus(data) {
   state.lastStatus = data;
   const dot = el("statusDot");
   dot.classList.toggle("ok", !!data.loaded);
-  dot.classList.toggle("bad", !data.loaded || (!!data.error && !data.live_available));
-
-  if (state.frame > 0) {
-    setLiveBadge("history", "HISTORY");
-    el("statusText").textContent = "Historical volume";
-    el("volumeTime").textContent =
-      "Frame -" + state.frame + " · " + fmtUtc(state.volume?.volume_time);
-    updateTimeUI();
-    return;
-  }
+  dot.classList.toggle("bad", !data.loaded);
 
   if (data.live_available) {
     setLiveBadge("live", data.live_complete ? "LIVE · COMPLETE" : "LIVE · SCANNING");
     el("statusText").textContent = "AWS Level-II chunk stream";
     el("volumeTime").textContent =
-      "Volume " + fmtUtc(data.live_volume_time) +
-      " · " + humanAge(data.live_age_seconds) +
-      " · " + data.live_chunk_count + " chunks";
+      `${fmtUtc(data.live_volume_time)} · ${data.live_chunk_count || 0} chunks`;
   } else if (data.archive_loaded) {
-    setLiveBadge(data.xradar_available ? "history" : "offline", "ARCHIVE");
-    el("statusText").textContent = data.xradar_available
-      ? "Waiting for real-time chunk stream"
-      : "Xradar 0.12+ needed for true live mode";
-    el("volumeTime").textContent =
-      "Latest complete " + fmtUtc(data.archive_volume_time) +
-      " · " + humanAge(data.archive_age_seconds);
+    setLiveBadge("history", "ARCHIVE");
+    el("statusText").textContent = "Waiting for live chunk feed";
+    el("volumeTime").textContent = "Latest complete " + fmtUtc(data.archive_volume_time);
   } else {
     setLiveBadge("offline", "OFFLINE");
     el("statusText").textContent = "Waiting for radar data";
-    el("volumeTime").textContent = data.live_error || data.error || "No volume loaded";
-  }
-
-  updateTimeUI();
-}
-
-async function loadHistory() {
-  try {
-    const data = await json("/api/history");
-    state.history = data.frames || [];
-    state.maxFrame = Number(data.max_frame || 0);
-    if (state.frame > state.maxFrame) state.frame = state.maxFrame;
-    updateTimeUI();
-  } catch (err) {
-    console.error("History load failed", err);
+    el("volumeTime").textContent = data.live_error || data.error || "No data";
   }
 }
 
 async function loadStatus() {
   try {
     const data = await json("/api/status");
-    const previousToken = state.lastStatus?.live_token;
-    const previousArchive = state.lastStatus?.archive_key;
+    const tokenChanged = data.live_token !== state.lastLiveToken;
+    state.lastLiveToken = data.live_token;
     updateStatus(data);
 
-    if (state.frame === 0) {
-      const liveChanged = data.live_available && data.live_token && data.live_token !== state.volume?.key;
-      const archiveChanged = !data.live_available && data.archive_key && data.archive_key !== state.volume?.key;
-      if (liveChanged || archiveChanged) {
-        await loadHistory();
-        await loadVolume(true);
-      }
-    } else if (data.archive_key && data.archive_key !== previousArchive) {
-      await loadHistory();
-    }
-
-    if (data.live_token !== previousToken && state.wallMode && state.frame === 0) {
-      renderWall();
+    if (tokenChanged) {
+      const preserveId = currentScan()?.id || null;
+      await loadElevations(preserveId);
     }
   } catch (err) {
     setLiveBadge("offline", "OFFLINE");
     el("statusText").textContent = "Backend unavailable";
     el("volumeTime").textContent = err.message;
-    el("statusDot").classList.add("bad");
   }
 }
 
-function getSweep() {
-  return state.volume?.sweeps.find((s) => s.index === state.sweep) || null;
-}
+function renderScanSequence() {
+  const container = el("scanSequence");
+  container.innerHTML = "";
 
-function getSweepPosition() {
-  if (!state.volume) return -1;
-  return state.volume.sweeps.findIndex((s) => s.index === state.sweep);
-}
+  for (let i = 0; i < state.scanSequence.length; i++) {
+    const scan = state.scanSequence[i];
+    const chip = document.createElement("div");
+    chip.className = "scan-chip " + String(scan.kind || "BASE").toLowerCase();
 
-function fillControls(volume, priorElevation = null) {
-  const currentField = state.field;
-  fieldSelect.innerHTML = "";
-
-  volume.fields.forEach((f) => {
-    const o = document.createElement("option");
-    o.value = f.id;
-    o.textContent = f.label;
-    fieldSelect.appendChild(o);
-  });
-
-  state.field = volume.fields.some((f) => f.id === currentField)
-    ? currentField
-    : (volume.fields[0]?.id || "reflectivity");
-  fieldSelect.value = state.field;
-
-  sweepSelect.innerHTML = "";
-  volume.sweeps.forEach((s) => {
-    const o = document.createElement("option");
-    o.value = s.index;
-    const progress = Number(s.completion ?? 100);
-    o.textContent = progress < 99.5
-      ? s.elevation.toFixed(2) + "° · " + Math.round(progress) + "%"
-      : s.elevation.toFixed(2) + "°";
-    sweepSelect.appendChild(o);
-  });
-
-  if (priorElevation !== null && volume.sweeps.length) {
-    let nearest = volume.sweeps[0];
-    let distance = Math.abs(nearest.elevation - priorElevation);
-    for (const s of volume.sweeps) {
-      const d = Math.abs(s.elevation - priorElevation);
-      if (d < distance) {
-        nearest = s;
-        distance = d;
-      }
+    if (i < state.scanSequence.length - 1 || Number(scan.completion ?? 100) >= 99.5) {
+      chip.classList.add("complete");
     }
-    state.sweep = nearest.index;
-  } else if (!volume.sweeps.some((s) => s.index === state.sweep)) {
-    state.sweep = volume.sweeps[0]?.index || 0;
+    if (i === state.scanSequence.length - 1 && state.lastStatus?.live_available) {
+      chip.classList.add("current");
+    }
+
+    chip.textContent = scan.label || Number(scan.elevation).toFixed(2) + "°";
+    container.appendChild(chip);
   }
 
-  sweepSelect.value = String(state.sweep);
-}
+  if (state.scanStatus?.expected_next) {
+    const next = state.scanStatus.expected_next;
+    const chip = document.createElement("div");
+    chip.className = "scan-chip expected " + String(next.kind || "BASE").toLowerCase();
+    chip.textContent = "NEXT · " + next.label;
+    container.appendChild(chip);
+  }
 
-function imageUrl(sweep = state.sweep, size = 640) {
-  if (!state.volume) return "";
-  const params = new URLSearchParams({
-    range_km: String(state.rangeKm),
-    smooth: state.smooth ? "true" : "false",
-    frame: String(state.frame),
-    size: String(size),
-    v: state.volume.key || "unknown",
+  if (!container.children.length) {
+    const chip = document.createElement("div");
+    chip.className = "scan-chip";
+    chip.textContent = "Waiting for live scan sequence…";
+    container.appendChild(chip);
+  }
+
+  const now = state.scanStatus?.current;
+  const next = state.scanStatus?.expected_next;
+  el("scanNowLabel").textContent = now
+    ? "NOW: " + now.label + (Number(now.completion ?? 100) < 99.5 ? ` · ${Math.round(now.completion)}%` : "")
+    : "Waiting for scan metadata…";
+  el("scanNextLabel").textContent = next ? "NEXT: " + next.label : "";
+
+  requestAnimationFrame(() => {
+    container.scrollLeft = container.scrollWidth;
   });
-  return `/api/image/${encodeURIComponent(state.field)}/${sweep}.png?${params.toString()}`;
 }
 
-function prefetchSweep(sweep) {
-  if (!state.volume?.sweeps.some((s) => s.index === sweep)) return;
-  const image = new Image();
-  image.src = imageUrl(sweep, 640);
-}
+async function loadElevations(preserveScanId = null) {
+  try {
+    const data = await json("/api/elevations");
+    const priorElevation = state.selectedElevation;
 
-function prefetchNeighbors() {
-  const pos = getSweepPosition();
-  if (pos < 0 || state.wallMode) return;
-  for (const offset of [-1, 1]) {
-    const neighbor = state.volume.sweeps[pos + offset];
-    if (neighbor) prefetchSweep(neighbor.index);
+    state.slots = data.slots || [];
+    state.scanSequence = data.scan_sequence || [];
+    state.scanStatus = data.scan_status || {};
+
+    fillElevationSelect();
+    renderScanSequence();
+
+    if (priorElevation !== null && state.slots.length) {
+      let bestIndex = 0;
+      let best = Infinity;
+      state.slots.forEach((slot, index) => {
+        const delta = Math.abs(Number(slot.elevation) - Number(priorElevation));
+        if (delta < best) {
+          best = delta;
+          bestIndex = index;
+        }
+      });
+      state.selectedElevation = Number(state.slots[bestIndex].elevation);
+      sweepSelect.value = String(bestIndex);
+    }
+
+    await loadScanHistory(preserveScanId);
+
+    if (state.wallMode) renderWall();
+  } catch (err) {
+    console.error("Elevation load failed", err);
+    toast("Could not load elevation inventory.");
   }
+}
+
+async function loadScanHistory(preserveScanId = null, resetToNewest = false) {
+  if (state.selectedElevation === null) {
+    state.scanHistory = [];
+    state.scanIndex = 0;
+    updateTimeUI();
+    return;
+  }
+
+  try {
+    const data = await json(
+      "/api/scan-history?elevation=" +
+      encodeURIComponent(Number(state.selectedElevation).toFixed(2)) +
+      "&limit=10"
+    );
+
+    const oldIndex = state.scanIndex;
+    state.scanHistory = data.scans || [];
+
+    if (resetToNewest) {
+      state.scanIndex = 0;
+    } else if (preserveScanId) {
+      const found = state.scanHistory.findIndex((scan) => scan.id === preserveScanId);
+      state.scanIndex = found >= 0 ? found : Math.min(oldIndex, Math.max(0, state.scanHistory.length - 1));
+    } else {
+      state.scanIndex = Math.min(oldIndex, Math.max(0, state.scanHistory.length - 1));
+    }
+
+    updateTimeUI();
+    renderSingleRadar();
+  } catch (err) {
+    console.error("Scan history failed", err);
+    state.scanHistory = [];
+    state.scanIndex = 0;
+    updateTimeUI();
+  }
+}
+
+function updateTimeUI() {
+  const scan = currentScan();
+  el("timePastBtn").disabled = !scan || state.scanIndex >= state.scanHistory.length - 1;
+  el("timeFutureBtn").disabled = !scan || state.scanIndex <= 0;
+  el("goLiveBtn").classList.toggle("active", state.scanIndex === 0);
+
+  if (!scan) {
+    el("timeLabel").textContent = "NO SCAN";
+    el("timeStamp").textContent = "—";
+    return;
+  }
+
+  el("timeLabel").textContent =
+    state.scanIndex === 0 ? scanAgeLabel(scan) : `-${state.scanIndex} SCAN`;
+  el("timeStamp").textContent =
+    fmtUtc(scan.scan_time || scan.volume_time);
+}
+
+async function stepTime(direction) {
+  if (!state.scanHistory.length) {
+    toast("No scans are available for this elevation.");
+    return;
+  }
+
+  const next = state.scanIndex + direction;
+  if (next < 0) {
+    toast("Already on the newest available scan.");
+    return;
+  }
+  if (next >= state.scanHistory.length) {
+    toast("Oldest cached scan reached.");
+    return;
+  }
+
+  state.scanIndex = next;
+  updateTimeUI();
+  renderSingleRadar();
+}
+
+function selectedSlotIndex() {
+  return state.slots.findIndex(
+    (slot) => Math.abs(Number(slot.elevation) - Number(state.selectedElevation)) <= 0.06
+  );
+}
+
+async function stepElevation(direction) {
+  const index = selectedSlotIndex();
+  if (index < 0) return;
+
+  const next = state.slots[index + direction];
+  if (!next) return;
+
+  state.selectedElevation = Number(next.elevation);
+  sweepSelect.value = String(index + direction);
+  state.scanIndex = 0;
+  await loadScanHistory(null, true);
 }
 
 function beamHeightArlKm(horizontalRangeKm, elevationDeg) {
@@ -263,42 +388,29 @@ function kmToKft(km) {
   return km * 3.280839895;
 }
 
-function exactSelectedHeightKm() {
-  if (!state.point) return null;
-  const row = state.point.rows?.find((r) => r.sweep === state.sweep);
-  return row ? Number(row.height_km) : null;
-}
-
 function updateTiltHud() {
-  const sweep = getSweep();
-  if (!sweep || !state.volume) return;
+  const scan = currentScan();
+  const elevation = state.selectedElevation;
 
-  const pos = getSweepPosition();
-  const completion = Number(sweep.completion ?? 100);
-  el("tiltDegree").textContent = sweep.elevation.toFixed(2) + "°";
-  el("tiltPosition").textContent =
-    `Tilt ${pos + 1} of ${state.volume.sweeps.length}` +
-    (completion < 99.5 ? ` · ${Math.round(completion)}% received` : "");
-  el("sweepLabel").textContent =
-    `${sweep.elevation.toFixed(2)}° elevation · tilt ${pos + 1}/${state.volume.sweeps.length}`;
-  el("currentTiltValue").textContent = sweep.elevation.toFixed(2) + "°";
+  if (elevation === null) {
+    el("tiltDegree").textContent = "—°";
+    el("tiltPosition").textContent = "No tilt";
+    return;
+  }
 
-  const exactKm = exactSelectedHeightKm();
+  el("tiltDegree").textContent = Number(elevation).toFixed(2) + "°";
+  el("tiltPosition").textContent = scan
+    ? `${scan.label} · ${scanAgeLabel(scan)}`
+    : "No scan available";
+
   const activeRange = state.hoverRangeKm ?? state.point?.range_km ?? null;
-
-  if (exactKm !== null && state.hoverRangeKm === null) {
-    const kft = kmToKft(exactKm);
-    el("beamHeightHud").textContent = `Beam center ${kft.toFixed(1)} kft ARL at selected point`;
-    el("currentHeightValue").textContent = kft.toFixed(1) + " kft";
-  } else if (activeRange !== null) {
-    const approxKm = beamHeightArlKm(Number(activeRange), sweep.elevation);
+  if (activeRange !== null) {
+    const hKm = beamHeightArlKm(Number(activeRange), Number(elevation));
     el("beamHeightHud").textContent =
-      `Beam center ~${kmToKft(approxKm).toFixed(1)} kft ARL @ ${Number(activeRange).toFixed(1)} km`;
-    if (exactKm === null) el("currentHeightValue").textContent = "—";
+      `Beam center ~${kmToKft(hKm).toFixed(1)} kft ARL @ ${Number(activeRange).toFixed(1)} km`;
+    el("currentHeightValue").textContent = kmToKft(hKm).toFixed(1) + " kft";
   } else {
     el("beamHeightHud").textContent = "Move cursor over radar for beam height";
-    el("currentHeightValue").textContent =
-      exactKm === null ? "—" : kmToKft(exactKm).toFixed(1) + " kft";
   }
 
   if (state.hoverRangeKm !== null && state.hoverAzimuth !== null) {
@@ -308,9 +420,50 @@ function updateTiltHud() {
     el("cursorHud").textContent = "Wheel ↑ higher tilt · Wheel ↓ lower tilt";
   }
 
-  el("tiltDownBtn").disabled = pos <= 0;
-  el("tiltUpBtn").disabled = pos >= state.volume.sweeps.length - 1;
-  updateInspectorHighlight();
+  el("currentTiltValue").textContent = Number(elevation).toFixed(2) + "°";
+
+  const index = selectedSlotIndex();
+  el("tiltDownBtn").disabled = index <= 0;
+  el("tiltUpBtn").disabled = index < 0 || index >= state.slots.length - 1;
+}
+
+function renderSingleRadar() {
+  const scan = currentScan();
+  updateTiltHud();
+  updateTimeUI();
+
+  if (!scan) {
+    radarImage.removeAttribute("src");
+    el("productLabel").textContent = "No scan available";
+    el("sweepLabel").textContent =
+      state.selectedElevation === null ? "—" : Number(state.selectedElevation).toFixed(2) + "°";
+    return;
+  }
+
+  const url = scanUrl(scan, 640);
+  radarImage.src = url;
+
+  radarImage.onerror = () => {
+    el("productLabel").textContent =
+      "Moment unavailable in this scan · use ← for previous available scan";
+  };
+
+  const fieldMeta = FIELD_OPTIONS.find((item) => item[0] === state.field);
+  el("productLabel").textContent =
+    (fieldMeta?.[1] || state.field) +
+    (fieldMeta?.[2] ? " · " + fieldMeta[2] : "") +
+    (state.smooth ? " · 2-D interpolated" : "");
+  el("sweepLabel").textContent =
+    `${Number(state.selectedElevation).toFixed(2)}° · ${scan.label} · ${scanAgeLabel(scan)}`;
+
+  const older = state.scanHistory[state.scanIndex + 1];
+  const newer = state.scanHistory[state.scanIndex - 1];
+  [older, newer].filter(Boolean).forEach((item) => {
+    const preload = new Image();
+    preload.src = scanUrl(item, 640);
+  });
+
+  renderBoundaries();
 }
 
 function segmentsToPath(segments) {
@@ -324,14 +477,16 @@ function segmentsToPath(segments) {
 
 function boundarySvgMarkup() {
   if (!state.boundaries) return "";
-  const countyPath = segmentsToPath(state.boundaries.counties);
-  const statePath = segmentsToPath(state.boundaries.states);
-  return `<path class="county" d="${countyPath}"></path><path class="state" d="${statePath}"></path>`;
+  return (
+    `<path class="county" d="${segmentsToPath(state.boundaries.counties)}"></path>` +
+    `<path class="state" d="${segmentsToPath(state.boundaries.states)}"></path>`
+  );
 }
 
 function renderBoundaries() {
   if (!state.boundaries) return;
   const r = state.rangeKm;
+
   const svg = el("boundaryOverlay");
   svg.setAttribute("viewBox", `${-r} ${-r} ${2 * r} ${2 * r}`);
   svg.innerHTML = boundarySvgMarkup();
@@ -347,155 +502,70 @@ async function loadBoundaries() {
     renderBoundaries();
     return;
   }
+
   state.boundariesLoading = true;
   try {
     state.boundaries = await json("/api/boundaries?range_km=330");
     renderBoundaries();
   } catch (err) {
     console.warn("Boundary load failed", err);
-    toast("State/county outlines could not be loaded.");
   } finally {
     state.boundariesLoading = false;
   }
 }
 
-function renderSingleRadar() {
-  if (!state.volume || !state.field) return;
-
-  const url = imageUrl(state.sweep, 640);
-  const token = ++state.renderToken;
-  const loader = new Image();
-
-  loader.onload = () => {
-    if (token !== state.renderToken) return;
-    radarImage.src = url;
-    updateTiltHud();
-    renderBoundaries();
-    setTimeout(prefetchNeighbors, 0);
-  };
-
-  loader.onerror = () => {
-    if (token === state.renderToken) {
-      toast("This moment is not available on that tilt yet.");
-    }
-  };
-
-  loader.src = url;
-
-  const field = state.volume.fields.find((f) => f.id === state.field);
-  el("productLabel").textContent = field
-    ? `${field.label}${field.units ? " · " + field.units : ""}${state.smooth ? " · 2-D interpolated" : ""}`
-    : state.field;
-  updateTiltHud();
-}
-
-function scanKindClass(kind) {
-  return String(kind || "BASE").toLowerCase();
-}
-
-function renderScanSequence() {
-  const sequence = state.volume?.scan_sequence || [];
-  const status = state.volume?.scan_status || {};
-  const container = el("scanSequence");
-  container.innerHTML = "";
-
-  sequence.forEach((scan, idx) => {
-    const chip = document.createElement("div");
-    chip.className = "scan-chip " + scanKindClass(scan.kind);
-    if (idx < sequence.length - 1 || Number(scan.completion ?? 100) >= 99.5) {
-      chip.classList.add("complete");
-    }
-    if (idx === sequence.length - 1 && state.volume?.source === "live") {
-      chip.classList.add("current");
-    }
-    chip.textContent = scan.label || (scan.elevation.toFixed(2) + "°");
-    container.appendChild(chip);
-  });
-
-  if (status.expected_next && state.volume?.source === "live") {
-    const next = document.createElement("div");
-    next.className = "scan-chip expected " + scanKindClass(status.expected_next.kind);
-    next.textContent = "NEXT · " + status.expected_next.label;
-    container.appendChild(next);
-  }
-
-  if (!sequence.length) {
-    const chip = document.createElement("div");
-    chip.className = "scan-chip";
-    chip.textContent = "Waiting for first sweep…";
-    container.appendChild(chip);
-  }
-
-  const current = status.current;
-  const next = status.expected_next;
-  if (state.volume?.source === "live" && current) {
-    const pct = Number(current.completion ?? 100);
-    el("scanNowLabel").textContent =
-      "NOW: " + current.label + (pct < 99.5 ? " · " + Math.round(pct) + "%" : "");
-  } else {
-    el("scanNowLabel").textContent =
-      state.volume ? "Volume " + fmtUtc(state.volume.volume_time) : "Waiting for scan metadata…";
-  }
-
-  el("scanNextLabel").textContent =
-    state.volume?.source === "live" && next ? "NEXT: " + next.label : "";
-
-  requestAnimationFrame(() => {
-    container.scrollLeft = container.scrollWidth;
-  });
+function sameElevation(a, b) {
+  return a !== null && a !== undefined &&
+    b !== null && b !== undefined &&
+    Math.abs(Number(a) - Number(b)) <= 0.06;
 }
 
 function renderWall() {
-  if (!state.volume || !state.field) return;
-
   const wall = el("tiltWall");
   wall.innerHTML = "";
 
-  const panels = (state.volume.panel_sweeps || state.volume.sweeps || []).slice(0, 16);
-  const currentScan = state.volume.scan_status?.current || null;
-  const nextScan = state.volume.scan_status?.expected_next || null;
+  const currentPhysical = state.scanStatus?.current || null;
+  const expectedNext = state.scanStatus?.expected_next || null;
 
   for (let i = 0; i < 16; i++) {
-    const panel = panels[i];
+    const slot = state.slots[i];
     const tile = document.createElement("div");
     tile.className = "wall-tile";
 
-    if (!panel) {
+    if (!slot) {
       tile.classList.add("wall-empty");
       tile.textContent = "No base tilt";
       wall.appendChild(tile);
       continue;
     }
 
-    const currentMatch = currentScan &&
-      Math.abs(Number(currentScan.elevation) - Number(panel.elevation)) <= 0.06;
-    const nextMatch = nextScan &&
-      Math.abs(Number(nextScan.elevation) - Number(panel.elevation)) <= 0.06;
+    const scan = slot.latest;
+    const currentMatch = currentPhysical && sameElevation(currentPhysical.elevation, slot.elevation);
+    const nextMatch = expectedNext && sameElevation(expectedNext.elevation, slot.elevation);
 
-    if (panel.available && panel.index === state.sweep) {
+    if (sameElevation(slot.elevation, state.selectedElevation)) {
       tile.classList.add("active");
     }
-    if (currentMatch && currentScan.kind !== "BASE") {
+    if (currentMatch && currentPhysical.kind !== "BASE") {
       tile.classList.add("supp-current");
     } else if (nextMatch) {
       tile.classList.add("next-scan");
     }
 
-    if (panel.available) {
+    if (scan) {
       const img = document.createElement("img");
-      img.alt = `${Number(panel.elevation).toFixed(2)} degree ${state.field}`;
-      img.src = imageUrl(panel.index, 300);
-      img.addEventListener("error", () => {
-        img.style.opacity = "0.16";
-        progress.textContent = "NO " + state.field.toUpperCase();
-      });
+      img.alt = Number(slot.elevation).toFixed(2) + " degree " + state.field;
+      img.src = scanUrl(scan, 300);
+      img.onerror = () => {
+        img.style.opacity = "0.14";
+      };
       tile.appendChild(img);
     } else {
       const waiting = document.createElement("div");
       waiting.className = "wall-empty";
       waiting.style.position = "absolute";
       waiting.style.inset = "0";
-      waiting.textContent = "WAITING";
+      waiting.textContent = "NO SCAN";
       tile.appendChild(waiting);
     }
 
@@ -505,177 +575,72 @@ function renderWall() {
 
     const label = document.createElement("div");
     label.className = "wall-label";
-    label.textContent = Number(panel.elevation).toFixed(2) + "°";
+    label.textContent = Number(slot.elevation).toFixed(2) + "°";
 
     const progress = document.createElement("div");
-    const completion = Number(panel.completion ?? 0);
-    progress.className = "wall-progress" +
-      (panel.available && completion < 99.5 ? " scanning" : "");
-    progress.textContent = panel.available
-      ? (completion < 99.5 ? Math.max(1, Math.round(completion)) + "%" : "READY")
-      : "WAIT";
+    progress.className = "wall-progress";
+    progress.textContent = scan ? scanAgeLabel(scan) : "WAIT";
 
     tile.append(bsvg, label, progress);
 
-    if (currentMatch && currentScan.kind !== "BASE") {
+    if (currentMatch && currentPhysical.kind !== "BASE") {
       const tag = document.createElement("div");
       tag.className = "wall-tag";
-      tag.textContent = "NOW · " + currentScan.label;
+      tag.textContent = "NOW · " + currentPhysical.label;
       tile.appendChild(tag);
-    } else if (nextMatch && nextScan) {
+    } else if (nextMatch && expectedNext) {
       const tag = document.createElement("div");
       tag.className = "wall-tag";
-      tag.textContent = "NEXT · " + nextScan.label;
+      tag.textContent = "NEXT · " + expectedNext.label;
       tile.appendChild(tag);
     }
 
-    if (panel.available) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.setAttribute(
-        "aria-label",
-        "Open " + Number(panel.elevation).toFixed(2) + " degree tilt"
-      );
-      button.addEventListener("click", () => {
-        state.sweep = panel.index;
-        sweepSelect.value = String(panel.index);
-        setWallMode(false);
-        renderSingleRadar();
-      });
-      tile.appendChild(button);
-    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute(
+      "aria-label",
+      "Open " + Number(slot.elevation).toFixed(2) + " degree tilt"
+    );
+    button.addEventListener("click", async () => {
+      state.selectedElevation = Number(slot.elevation);
+      sweepSelect.value = String(i);
+      state.scanIndex = 0;
+      setWallMode(false);
+      await loadScanHistory(null, true);
+    });
+    tile.appendChild(button);
 
     wall.appendChild(tile);
   }
 
-  if (state.frame === 0 && state.volume.source === "live") {
-    const currentText = currentScan ? "NOW " + currentScan.label : "waiting for scan";
-    const nextText = nextScan ? " · NEXT " + nextScan.label : "";
-    el("wallStatus").textContent = currentText + nextText;
-  } else {
-    el("wallStatus").textContent =
-      `${panels.length} base tilts · ${fmtUtc(state.volume.volume_time)}`;
-  }
+  const nowText = currentPhysical ? "NOW " + currentPhysical.label : "No live physical cut yet";
+  const nextText = expectedNext ? " · NEXT " + expectedNext.label : "";
+  el("wallStatus").textContent = nowText + nextText;
 
   renderBoundaries();
 }
 
-function renderRadar() {
-  if (state.wallMode) renderWall();
-  else renderSingleRadar();
-}
-
 function setWallMode(enabled) {
-  state.wallMode = !!enabled;
+  state.wallMode = Boolean(enabled);
   el("singleView").classList.toggle("hidden", state.wallMode);
   el("wallView").classList.toggle("hidden", !state.wallMode);
   el("wallToggleBtn").textContent = state.wallMode ? "Single Panel" : "16 Panel";
-  if (state.wallMode) renderWall();
-  else renderSingleRadar();
-}
 
-function setSweep(sweepIndex) {
-  if (!state.volume?.sweeps.some((s) => s.index === sweepIndex)) return;
-  state.sweep = sweepIndex;
-  sweepSelect.value = String(sweepIndex);
-  renderRadar();
-}
-
-function stepSweep(direction) {
-  const pos = getSweepPosition();
-  if (pos < 0) return;
-  const next = state.volume.sweeps[pos + direction];
-  if (next) setSweep(next.index);
-}
-
-async function setFrame(frame) {
-  await loadHistory();
-
-  if (!state.history.length) {
-    toast("No radar history is available yet.");
-    return;
-  }
-
-  const requested = Number(frame);
-  const nextFrame = Math.max(0, Math.min(state.maxFrame, requested));
-  if (nextFrame === state.frame && state.volume) {
-    if (requested !== nextFrame) {
-      toast(nextFrame === 0 ? "Already at LIVE." : "Oldest cached volume reached.");
-    }
-    return;
-  }
-
-  const priorElevation = getSweep()?.elevation ?? null;
-  const selectedX = state.point?.x_km;
-  const selectedY = state.point?.y_km;
-
-  state.frame = nextFrame;
-  state.point = null;
-  el("analysisContent").classList.add("hidden");
-  el("emptyState").classList.remove("hidden");
-  updateTimeUI();
-
-  await loadVolume(true, priorElevation);
-
-  if (selectedX !== undefined && selectedY !== undefined) {
-    await inspectAt(selectedX, selectedY, false);
-  }
-
-  const meta = currentFrameMeta();
-  toast(
-    nextFrame === 0
-      ? "Returned to LIVE."
-      : `Loaded -${nextFrame}: ${fmtUtc(meta?.volume_time)}`
-  );
-}
-
-async function loadVolume(force = false, priorElevationOverride = null) {
-  try {
-    const previousSweep = getSweep();
-    const priorElevation = priorElevationOverride ?? previousSweep?.elevation ?? null;
-    const selectedX = state.point?.x_km;
-    const selectedY = state.point?.y_km;
-    const oldKey = state.volume?.key;
-
-    const volume = await json("/api/volume?frame=" + state.frame);
-    state.volume = volume;
-    fillControls(volume, priorElevation);
-    renderScanSequence();
-    renderRadar();
-    updateTimeUI();
-
-    if (force || oldKey !== volume.key) {
-      if (selectedX !== undefined && selectedY !== undefined) {
-        await inspectAt(selectedX, selectedY, false);
-      }
-    }
-
-    loadBoundaries();
-    if (state.lastStatus) updateStatus(state.lastStatus);
-  } catch (err) {
-    toast("Could not load radar volume.");
-    console.error(err);
+  if (state.wallMode) {
+    renderWall();
+  } else {
+    renderSingleRadar();
   }
 }
 
-function value(row, field, digits = 1) {
-  const v = row.values?.[field];
-  return v === null || v === undefined ? "—" : Number(v).toFixed(digits);
-}
+async function selectElevationByIndex(index) {
+  const slot = state.slots[index];
+  if (!slot) return;
 
-function updateInspectorHighlight() {
-  const rows = el("inspectorRows").querySelectorAll("tr[data-sweep]");
-  rows.forEach((row) => {
-    row.classList.toggle("current", Number(row.dataset.sweep) === state.sweep);
-  });
-
-  if (state.point) {
-    const active = state.point.rows?.find((r) => r.sweep === state.sweep);
-    if (active) {
-      el("currentHeightValue").textContent =
-        kmToKft(Number(active.height_km)).toFixed(1) + " kft";
-    }
-  }
+  state.selectedElevation = Number(slot.elevation);
+  state.scanIndex = 0;
+  sweepSelect.value = String(index);
+  await loadScanHistory(null, true);
 }
 
 function renderInspector(data) {
@@ -690,42 +655,32 @@ function renderInspector(data) {
   const tbody = el("inspectorRows");
   tbody.innerHTML = "";
 
-  data.rows.forEach((row) => {
+  for (const row of data.rows || []) {
     const tr = document.createElement("tr");
-    tr.dataset.sweep = String(row.sweep);
-    tr.title = "Jump to " + row.elevation.toFixed(2) + "°";
-    tr.addEventListener("click", () => setSweep(row.sweep));
-
-    const vals = [
-      row.elevation.toFixed(2) + "°",
+    const values = [
+      Number(row.elevation).toFixed(2) + "°",
       kmToKft(Number(row.height_km)).toFixed(1) + " kft",
-      value(row, "reflectivity"),
-      value(row, "velocity"),
-      value(row, "differential_reflectivity", 2),
-      value(row, "cross_correlation_ratio", 3),
+      row.values?.reflectivity == null ? "—" : Number(row.values.reflectivity).toFixed(1),
+      row.values?.velocity == null ? "—" : Number(row.values.velocity).toFixed(1),
+      row.values?.differential_reflectivity == null ? "—" : Number(row.values.differential_reflectivity).toFixed(2),
+      row.values?.cross_correlation_ratio == null ? "—" : Number(row.values.cross_correlation_ratio).toFixed(3),
     ];
-
-    vals.forEach((v) => {
+    values.forEach((value) => {
       const td = document.createElement("td");
-      td.textContent = v;
+      td.textContent = value;
       tr.appendChild(td);
     });
-
     tbody.appendChild(tr);
-  });
-
-  updateTiltHud();
-  updateInspectorHighlight();
+  }
 }
 
-async function inspectAt(xKm, yKm, showErrors = true) {
+async function inspectAt(xKm, yKm) {
   try {
     const data = await json(
-      `/api/inspect?x_km=${Number(xKm).toFixed(3)}&y_km=${Number(yKm).toFixed(3)}&frame=${state.frame}`
+      `/api/inspect?x_km=${Number(xKm).toFixed(3)}&y_km=${Number(yKm).toFixed(3)}&frame=0`
     );
     renderInspector(data);
   } catch (err) {
-    if (showErrors) toast("Column analysis failed at this point.");
     console.error(err);
   }
 }
@@ -745,9 +700,9 @@ radarStage.addEventListener("mousemove", (event) => {
   const p = eventCoordinates(event);
   state.hoverRangeKm = p.rangeKm;
   state.hoverAzimuth = p.azimuth;
-  const sweep = getSweep();
-  if (sweep) {
-    const hKm = beamHeightArlKm(p.rangeKm, sweep.elevation);
+
+  if (state.selectedElevation !== null) {
+    const hKm = beamHeightArlKm(p.rangeKm, state.selectedElevation);
     el("cursorReadout").textContent =
       `Az ${p.azimuth.toFixed(1)}° · ${p.rangeKm.toFixed(1)} km · beam ~${kmToKft(hKm).toFixed(1)} kft ARL`;
   }
@@ -757,13 +712,10 @@ radarStage.addEventListener("mousemove", (event) => {
 radarStage.addEventListener("mouseleave", () => {
   state.hoverRangeKm = null;
   state.hoverAzimuth = null;
-  if (state.point) {
-    el("cursorReadout").textContent =
-      `Selected: az ${state.point.azimuth.toFixed(1)}° · range ${state.point.range_km.toFixed(1)} km`;
-  } else {
-    el("cursorReadout").textContent =
-      "Move over radar for azimuth, range and beam height";
-  }
+  el("cursorReadout").textContent =
+    state.point
+      ? `Selected: az ${state.point.azimuth.toFixed(1)}° · range ${state.point.range_km.toFixed(1)} km`
+      : "Move over radar for azimuth, range and beam height";
   updateTiltHud();
 });
 
@@ -782,8 +734,8 @@ radarStage.addEventListener("wheel", (event) => {
   event.preventDefault();
   if (state.wheelLocked) return;
   state.wheelLocked = true;
-  stepSweep(event.deltaY < 0 ? 1 : -1);
-  setTimeout(() => { state.wheelLocked = false; }, 55);
+  stepElevation(event.deltaY < 0 ? 1 : -1);
+  setTimeout(() => { state.wheelLocked = false; }, 60);
 }, {passive: false});
 
 document.addEventListener("keydown", (event) => {
@@ -792,53 +744,53 @@ document.addEventListener("keydown", (event) => {
 
   if (event.key === "ArrowUp") {
     event.preventDefault();
-    stepSweep(1);
+    stepElevation(1);
   } else if (event.key === "ArrowDown") {
     event.preventDefault();
-    stepSweep(-1);
+    stepElevation(-1);
   } else if (event.key === "ArrowLeft") {
     event.preventDefault();
-    setFrame(state.frame + 1);
+    stepTime(1);
   } else if (event.key === "ArrowRight") {
     event.preventDefault();
-    setFrame(state.frame - 1);
+    stepTime(-1);
   }
 });
 
-el("tiltUpBtn").addEventListener("click", () => stepSweep(1));
-el("tiltDownBtn").addEventListener("click", () => stepSweep(-1));
-el("timePastBtn").addEventListener("click", () => setFrame(state.frame + 1));
-el("timeFutureBtn").addEventListener("click", () => setFrame(state.frame - 1));
-el("goLiveBtn").addEventListener("click", () => setFrame(0));
+el("tiltUpBtn").addEventListener("click", () => stepElevation(1));
+el("tiltDownBtn").addEventListener("click", () => stepElevation(-1));
+el("timePastBtn").addEventListener("click", () => stepTime(1));
+el("timeFutureBtn").addEventListener("click", () => stepTime(-1));
+el("goLiveBtn").addEventListener("click", () => {
+  state.scanIndex = 0;
+  updateTimeUI();
+  renderSingleRadar();
+});
 el("wallToggleBtn").addEventListener("click", () => setWallMode(!state.wallMode));
 
 fieldSelect.addEventListener("change", () => {
   state.field = fieldSelect.value;
-  renderRadar();
+  if (state.wallMode) renderWall();
+  else renderSingleRadar();
 });
 
 sweepSelect.addEventListener("change", () => {
-  setSweep(Number(sweepSelect.value));
+  selectElevationByIndex(Number(sweepSelect.value));
 });
 
 smoothToggle.addEventListener("change", () => {
   state.smooth = smoothToggle.checked;
-  renderRadar();
+  if (state.wallMode) renderWall();
+  else renderSingleRadar();
 });
 
 rangeSelect.addEventListener("change", () => {
   state.rangeKm = Number(rangeSelect.value);
   cursorMarker.classList.add("hidden");
   state.point = null;
-  state.hoverRangeKm = null;
-  state.hoverAzimuth = null;
-  el("emptyState").classList.remove("hidden");
-  el("analysisContent").classList.add("hidden");
-  el("pointBadge").textContent = "No point selected";
-  el("cursorReadout").textContent =
-    "Move over radar for azimuth, range and beam height";
   renderBoundaries();
-  renderRadar();
+  if (state.wallMode) renderWall();
+  else renderSingleRadar();
 });
 
 el("refreshBtn").addEventListener("click", async () => {
@@ -848,9 +800,8 @@ el("refreshBtn").addEventListener("click", async () => {
   try {
     const result = await json("/api/refresh", {method: "POST"});
     updateStatus(result);
-    await loadHistory();
-    await loadVolume(true);
-    toast(result.changed ? "Radar data updated." : "Already current.");
+    await loadElevations(currentScan()?.id || null);
+    toast(result.changed ? "Radar scans updated." : "Already current.");
   } catch (err) {
     toast("Radar refresh failed.");
   } finally {
@@ -860,10 +811,12 @@ el("refreshBtn").addEventListener("click", async () => {
 });
 
 (async function init() {
+  populateFields();
   state.smooth = smoothToggle.checked;
-  await loadHistory();
+
   await loadStatus();
-  if (!state.volume) await loadVolume();
+  await loadElevations();
   loadBoundaries();
+
   setInterval(loadStatus, 2000);
 })();
