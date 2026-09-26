@@ -735,35 +735,117 @@ def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]
     }
 
 
-def _validate_field(radar, field: str, sweep: int) -> None:
-    if field not in FIELD_CONFIG or field not in radar.fields:
+def _archive_raw_sweep_for_field(radar, tilt: dict[str, Any], field: str) -> int:
+    if field not in radar.fields:
         raise HTTPException(status_code=404, detail=f"Field '{field}' is not available.")
-    if sweep < 0 or sweep >= radar.nsweeps:
-        raise HTTPException(status_code=400, detail="Sweep index is out of range.")
+
+    for raw_sweep in tilt["raw"]:
+        try:
+            data = radar.get_field(raw_sweep, field, copy=False)
+            if np.ma.count(data) > 0:
+                return int(raw_sweep)
+        except Exception:
+            continue
+
+    return int(tilt["raw"][0])
 
 
-def _render_polar_png(radar, field: str, sweep: int, range_km: float, smooth: bool) -> bytes:
-    with state_lock:
-        volume_key = state.key
+def _archive_tilt_arrays(
+    radar,
+    field: str,
+    logical_sweep: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    tilts = _archive_base_tilts(radar)
+    if logical_sweep < 0 or logical_sweep >= len(tilts):
+        raise HTTPException(status_code=400, detail="Tilt index is out of range.")
 
-    cache_key = (volume_key, field, sweep, round(range_km, 1), smooth, RASTER_SIZE)
+    tilt = tilts[logical_sweep]
+    raw_sweep = _archive_raw_sweep_for_field(radar, tilt, field)
+    data_ma = radar.get_field(raw_sweep, field, copy=False)
+    data = np.asarray(np.ma.filled(data_ma, np.nan), dtype=np.float32)
+    sweep_slice = radar.get_slice(raw_sweep)
+    azimuths = np.asarray(radar.azimuth["data"][sweep_slice], dtype=np.float32)
+    ranges_km = np.asarray(radar.range["data"], dtype=np.float32) / 1000.0
+    return data, azimuths, ranges_km, float(tilt["elevation"])
+
+
+def _live_tilt_arrays(
+    field: str,
+    logical_sweep: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    with live_lock:
+        tree = live_tree
+
+    if tree is None:
+        raise HTTPException(status_code=503, detail="Live chunk volume is not available.")
+
+    tilts = _live_base_tilts(tree)
+    if logical_sweep < 0 or logical_sweep >= len(tilts):
+        raise HTTPException(status_code=400, detail="Tilt index is out of range.")
+
+    tilt = tilts[logical_sweep]
+
+    for group in tilt["raw"]:
+        ds = tree[group].to_dataset(inherit="all_coords")
+        var_name = _live_field_name(ds, field)
+        if not var_name:
+            continue
+
+        da = ds[var_name]
+        if "range" not in da.dims:
+            continue
+
+        if "azimuth" in da.dims:
+            da = da.transpose("azimuth", "range")
+            azimuths = np.asarray(ds["azimuth"].values, dtype=np.float32)
+        elif "time" in da.dims and "azimuth" in ds.coords:
+            da = da.transpose("time", "range")
+            azimuths = np.asarray(ds["azimuth"].values, dtype=np.float32)
+        else:
+            continue
+
+        data = np.asarray(da.values, dtype=np.float32)
+        ranges_km = np.asarray(ds["range"].values, dtype=np.float32) / 1000.0
+
+        if data.ndim == 2 and data.shape[0] == len(azimuths):
+            return data, azimuths, ranges_km, float(tilt["elevation"])
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Field '{field}' is not available for this tilt yet.",
+    )
+
+
+def _render_array_png(
+    data: np.ndarray,
+    azimuths: np.ndarray,
+    ranges_km: np.ndarray,
+    field: str,
+    range_km: float,
+    smooth: bool,
+    size: int,
+    cache_key: tuple[Any, ...],
+) -> bytes:
     with image_cache_lock:
         cached = image_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    data_ma = radar.get_field(sweep, field, copy=False)
-    data = np.asarray(np.ma.filled(data_ma, np.nan), dtype=np.float32)
+    if field not in FIELD_CONFIG:
+        raise HTTPException(status_code=404, detail=f"Unknown field '{field}'.")
 
-    sweep_slice = radar.get_slice(sweep)
-    azimuths = np.asarray(radar.azimuth["data"][sweep_slice], dtype=np.float32)
-    ranges_km = np.asarray(radar.range["data"], dtype=np.float32) / 1000.0
+    data = np.asarray(data, dtype=np.float32)
+    azimuths = np.asarray(azimuths, dtype=np.float32)
+    ranges_km = np.asarray(ranges_km, dtype=np.float32)
+
+    if data.ndim != 2 or len(azimuths) != data.shape[0] or len(ranges_km) != data.shape[1]:
+        raise HTTPException(status_code=500, detail="Unexpected radar array geometry.")
 
     order = np.argsort(azimuths)
     az_sorted = azimuths[order]
     data_sorted = data[order]
 
-    axis = np.linspace(-range_km, range_km, RASTER_SIZE, dtype=np.float32)
+    axis = np.linspace(-range_km, range_km, size, dtype=np.float32)
     xx, yy = np.meshgrid(axis, axis[::-1])
     rr = np.hypot(xx, yy)
     az = (np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0
@@ -773,19 +855,38 @@ def _render_polar_png(radar, field: str, sweep: int, range_km: float, smooth: bo
     gate_lo = gate_hi - 1
     r0 = ranges_km[gate_lo]
     r1 = ranges_km[gate_hi]
-    range_weight = np.divide(rr - r0, r1 - r0, out=np.zeros_like(rr), where=(r1 != r0))
+    range_weight = np.divide(
+        rr - r0,
+        r1 - r0,
+        out=np.zeros_like(rr),
+        where=(r1 != r0),
+    )
     range_weight = np.clip(range_weight, 0.0, 1.0)
 
-    az_ext = np.concatenate(([az_sorted[-1] - 360.0], az_sorted, [az_sorted[0] + 360.0]))
+    az_ext = np.concatenate((
+        [az_sorted[-1] - 360.0],
+        az_sorted,
+        [az_sorted[0] + 360.0],
+    ))
     sorted_ray_indices = np.arange(len(az_sorted), dtype=np.int32)
-    ray_ext = np.concatenate(([sorted_ray_indices[-1]], sorted_ray_indices, [sorted_ray_indices[0]]))
+    ray_ext = np.concatenate((
+        [sorted_ray_indices[-1]],
+        sorted_ray_indices,
+        [sorted_ray_indices[0]],
+    ))
+
     ray_hi_pos = np.searchsorted(az_ext, az, side="right")
     ray_hi_pos = np.clip(ray_hi_pos, 1, len(az_ext) - 1)
     ray_lo_pos = ray_hi_pos - 1
 
     az0 = az_ext[ray_lo_pos]
     az1 = az_ext[ray_hi_pos]
-    az_weight = np.divide(az - az0, az1 - az0, out=np.zeros_like(az), where=(az1 != az0))
+    az_weight = np.divide(
+        az - az0,
+        az1 - az0,
+        out=np.zeros_like(az),
+        where=(az1 != az0),
+    )
     az_weight = np.clip(az_weight, 0.0, 1.0)
 
     ray_lo = ray_ext[ray_lo_pos]
@@ -804,7 +905,13 @@ def _render_polar_png(radar, field: str, sweep: int, range_km: float, smooth: bo
 
         numerator = np.zeros_like(rr, dtype=np.float32)
         denominator = np.zeros_like(rr, dtype=np.float32)
-        for values, weights in ((v00, w00), (v01, w01), (v10, w10), (v11, w11)):
+
+        for values, weights in (
+            (v00, w00),
+            (v01, w01),
+            (v10, w10),
+            (v11, w11),
+        ):
             valid = np.isfinite(values)
             numerator += np.where(valid, values, 0.0) * weights
             denominator += valid.astype(np.float32) * weights
@@ -822,7 +929,11 @@ def _render_polar_png(radar, field: str, sweep: int, range_km: float, smooth: bo
 
     sampled = np.where(rr <= ranges_km[-1], sampled, np.nan)
     cfg = FIELD_CONFIG[field]
-    norm = np.clip((sampled - cfg["vmin"]) / (cfg["vmax"] - cfg["vmin"]), 0.0, 1.0)
+    norm = np.clip(
+        (sampled - cfg["vmin"]) / (cfg["vmax"] - cfg["vmin"]),
+        0.0,
+        1.0,
+    )
     rgba = colormaps[cfg["cmap"]](np.nan_to_num(norm, nan=0.0), bytes=True)
     missing = ~np.isfinite(sampled)
     rgba[missing, 0] = 9
@@ -831,11 +942,15 @@ def _render_polar_png(radar, field: str, sweep: int, range_km: float, smooth: bo
     rgba[missing, 3] = 255
 
     output = io.BytesIO()
-    Image.fromarray(rgba, mode="RGBA").save(output, format="PNG", compress_level=1)
+    Image.fromarray(rgba, mode="RGBA").save(
+        output,
+        format="PNG",
+        compress_level=1,
+    )
     png = output.getvalue()
 
     with image_cache_lock:
-        if len(image_cache) >= 96:
+        if len(image_cache) >= 160:
             image_cache.pop(next(iter(image_cache)))
         image_cache[cache_key] = png
 
@@ -848,20 +963,75 @@ def api_image(
     sweep: int,
     range_km: float = Query(DEFAULT_RANGE_KM, ge=25, le=460),
     smooth: bool = Query(True),
+    frame: int = Query(0, ge=0, le=HISTORY_FRAMES),
+    size: int = Query(RASTER_SIZE, ge=180, le=900),
 ) -> Response:
-    radar = get_radar()
-    _validate_field(radar, field, sweep)
-    png = _render_polar_png(radar, field, sweep, range_km, smooth)
+    if field not in FIELD_CONFIG:
+        raise HTTPException(status_code=404, detail=f"Unknown field '{field}'.")
 
-    with state_lock:
-        volume_key = state.key or "unknown"
+    source_key: str
+
+    if frame == 0:
+        with live_lock:
+            has_live = live_tree is not None
+            token = live_token
+
+        if has_live:
+            data, azimuths, ranges_km, _ = _live_tilt_arrays(field, sweep)
+            source_key = token or "live"
+            cache_key = (
+                "live",
+                source_key,
+                field,
+                sweep,
+                round(range_km, 1),
+                smooth,
+                size,
+            )
+        else:
+            radar, entry = _archive_frame(0)
+            data, azimuths, ranges_km, _ = _archive_tilt_arrays(radar, field, sweep)
+            source_key = entry["key"]
+            cache_key = (
+                "archive",
+                source_key,
+                field,
+                sweep,
+                round(range_km, 1),
+                smooth,
+                size,
+            )
+    else:
+        radar, entry = _archive_frame(frame)
+        data, azimuths, ranges_km, _ = _archive_tilt_arrays(radar, field, sweep)
+        source_key = entry["key"]
+        cache_key = (
+            "archive",
+            source_key,
+            field,
+            sweep,
+            round(range_km, 1),
+            smooth,
+            size,
+        )
+
+    png = _render_array_png(
+        data,
+        azimuths,
+        ranges_km,
+        field,
+        range_km,
+        smooth,
+        size,
+        cache_key,
+    )
 
     return Response(
         png,
         media_type="image/png",
         headers={
             "Cache-Control": "public, max-age=31536000, immutable",
-            "ETag": f'"{volume_key}-{field}-{sweep}-{range_km}-{int(smooth)}"',
+            "ETag": f'"{source_key}-{field}-{sweep}-{range_km}-{int(smooth)}-{size}"',
         },
     )
 
