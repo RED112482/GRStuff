@@ -76,6 +76,7 @@
         </label>
 
         <button id="wallToggleBtn" type="button">16 Panel</button>
+        <button id="resetViewBtn" type="button">Reset View</button>
         <button id="refreshBtn" type="button">Refresh</button>
       </div>
 
@@ -103,7 +104,7 @@
             <div id="cursorHud" class="cursor-hud">Wheel ↑ higher tilt · Wheel ↓ lower tilt</div>
           </div>
 
-          <div class="nav-hint">↑/↓ tilt · ←/→ time · wheel tilt</div>
+          <div class="nav-hint">Drag pan · wheel zoom · ↑/↓ tilt · ←/→ time</div>
 
           <svg id="overlay" class="overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">
             <g class="rings">
@@ -132,7 +133,7 @@
       <div id="wallView" class="wall-shell hidden">
         <div class="wall-head">
           <div>
-            <div class="eyebrow">BASE ELEVATION PANELS · SUPPLEMENTALS LABELED</div>
+            <div class="eyebrow">ANCHOR-RELATIVE TILTS · SHARED PAN / ZOOM</div>
             <strong>16-Panel Tilt Wall</strong>
           </div>
           <div id="wallStatus" class="wall-status">Waiting for live volume…</div>
