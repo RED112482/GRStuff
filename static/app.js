@@ -389,74 +389,172 @@ function renderSingleRadar() {
   updateTiltHud();
 }
 
+function scanKindClass(kind) {
+  return String(kind || "BASE").toLowerCase();
+}
+
+function renderScanSequence() {
+  const sequence = state.volume?.scan_sequence || [];
+  const status = state.volume?.scan_status || {};
+  const container = el("scanSequence");
+  container.innerHTML = "";
+
+  sequence.forEach((scan, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "scan-chip " + scanKindClass(scan.kind);
+    if (idx < sequence.length - 1 || Number(scan.completion ?? 100) >= 99.5) {
+      chip.classList.add("complete");
+    }
+    if (idx === sequence.length - 1 && state.volume?.source === "live") {
+      chip.classList.add("current");
+    }
+    chip.textContent = scan.label || (scan.elevation.toFixed(2) + "°");
+    container.appendChild(chip);
+  });
+
+  if (status.expected_next && state.volume?.source === "live") {
+    const next = document.createElement("div");
+    next.className = "scan-chip expected " + scanKindClass(status.expected_next.kind);
+    next.textContent = "NEXT · " + status.expected_next.label;
+    container.appendChild(next);
+  }
+
+  if (!sequence.length) {
+    const chip = document.createElement("div");
+    chip.className = "scan-chip";
+    chip.textContent = "Waiting for first sweep…";
+    container.appendChild(chip);
+  }
+
+  const current = status.current;
+  const next = status.expected_next;
+  if (state.volume?.source === "live" && current) {
+    const pct = Number(current.completion ?? 100);
+    el("scanNowLabel").textContent =
+      "NOW: " + current.label + (pct < 99.5 ? " · " + Math.round(pct) + "%" : "");
+  } else {
+    el("scanNowLabel").textContent =
+      state.volume ? "Volume " + fmtUtc(state.volume.volume_time) : "Waiting for scan metadata…";
+  }
+
+  el("scanNextLabel").textContent =
+    state.volume?.source === "live" && next ? "NEXT: " + next.label : "";
+
+  requestAnimationFrame(() => {
+    container.scrollLeft = container.scrollWidth;
+  });
+}
+
 function renderWall() {
   if (!state.volume || !state.field) return;
 
   const wall = el("tiltWall");
   wall.innerHTML = "";
 
-  const tilts = state.volume.sweeps.slice(0, 16);
+  const panels = (state.volume.panel_sweeps || state.volume.sweeps || []).slice(0, 16);
+  const currentScan = state.volume.scan_status?.current || null;
+  const nextScan = state.volume.scan_status?.expected_next || null;
+
   for (let i = 0; i < 16; i++) {
-    const tilt = tilts[i];
+    const panel = panels[i];
     const tile = document.createElement("div");
     tile.className = "wall-tile";
 
-    if (!tilt) {
+    if (!panel) {
       tile.classList.add("wall-empty");
-      tile.textContent = "No additional base tilt";
+      tile.textContent = "No base tilt";
       wall.appendChild(tile);
       continue;
     }
 
-    if (tilt.index === state.sweep) tile.classList.add("active");
+    const currentMatch = currentScan &&
+      Math.abs(Number(currentScan.elevation) - Number(panel.elevation)) <= 0.06;
+    const nextMatch = nextScan &&
+      Math.abs(Number(nextScan.elevation) - Number(panel.elevation)) <= 0.06;
 
-    const img = document.createElement("img");
-    img.alt = `${tilt.elevation.toFixed(2)} degree ${state.field}`;
-    img.src = imageUrl(tilt.index, 300);
+    if (panel.available && panel.index === state.sweep) {
+      tile.classList.add("active");
+    }
+    if (currentMatch && currentScan.kind !== "BASE") {
+      tile.classList.add("supp-current");
+    } else if (nextMatch) {
+      tile.classList.add("next-scan");
+    }
 
-    const label = document.createElement("div");
-    label.className = "wall-label";
-    label.textContent = tilt.elevation.toFixed(2) + "°";
-
-    const progress = document.createElement("div");
-    const completion = Number(tilt.completion ?? 100);
-    progress.className = "wall-progress" + (completion < 99.5 ? " scanning" : "");
-    progress.textContent = completion < 99.5
-      ? Math.max(1, Math.round(completion)) + "%"
-      : "READY";
+    if (panel.available) {
+      const img = document.createElement("img");
+      img.alt = `${Number(panel.elevation).toFixed(2)} degree ${state.field}`;
+      img.src = imageUrl(panel.index, 300);
+      img.addEventListener("error", () => {
+        img.style.opacity = "0.16";
+        progress.textContent = "NO " + state.field.toUpperCase();
+      });
+      tile.appendChild(img);
+    } else {
+      const waiting = document.createElement("div");
+      waiting.className = "wall-empty";
+      waiting.style.position = "absolute";
+      waiting.style.inset = "0";
+      waiting.textContent = "WAITING";
+      tile.appendChild(waiting);
+    }
 
     const bsvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     bsvg.setAttribute("class", "wall-boundary");
     bsvg.setAttribute("aria-hidden", "true");
 
-    const button = document.createElement("button");
-    button.type = "button";
-    button.setAttribute("aria-label", "Open " + tilt.elevation.toFixed(2) + " degree tilt");
-    button.addEventListener("click", () => {
-      state.sweep = tilt.index;
-      sweepSelect.value = String(tilt.index);
-      setWallMode(false);
-      renderSingleRadar();
-    });
+    const label = document.createElement("div");
+    label.className = "wall-label";
+    label.textContent = Number(panel.elevation).toFixed(2) + "°";
 
-    img.addEventListener("error", () => {
-      img.style.opacity = "0.18";
-      progress.textContent = "WAIT";
-      progress.classList.add("scanning");
-    });
+    const progress = document.createElement("div");
+    const completion = Number(panel.completion ?? 0);
+    progress.className = "wall-progress" +
+      (panel.available && completion < 99.5 ? " scanning" : "");
+    progress.textContent = panel.available
+      ? (completion < 99.5 ? Math.max(1, Math.round(completion)) + "%" : "READY")
+      : "WAIT";
 
-    tile.append(img, bsvg, label, progress, button);
+    tile.append(bsvg, label, progress);
+
+    if (currentMatch && currentScan.kind !== "BASE") {
+      const tag = document.createElement("div");
+      tag.className = "wall-tag";
+      tag.textContent = "NOW · " + currentScan.label;
+      tile.appendChild(tag);
+    } else if (nextMatch && nextScan) {
+      const tag = document.createElement("div");
+      tag.className = "wall-tag";
+      tag.textContent = "NEXT · " + nextScan.label;
+      tile.appendChild(tag);
+    }
+
+    if (panel.available) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute(
+        "aria-label",
+        "Open " + Number(panel.elevation).toFixed(2) + " degree tilt"
+      );
+      button.addEventListener("click", () => {
+        state.sweep = panel.index;
+        sweepSelect.value = String(panel.index);
+        setWallMode(false);
+        renderSingleRadar();
+      });
+      tile.appendChild(button);
+    }
+
     wall.appendChild(tile);
   }
 
-  const incomplete = state.volume.sweeps.filter((s) => Number(s.completion ?? 100) < 99.5);
   if (state.frame === 0 && state.volume.source === "live") {
-    el("wallStatus").textContent = incomplete.length
-      ? `${state.volume.sweeps.length} base tilts · receiving ${incomplete[incomplete.length - 1].elevation.toFixed(2)}° now`
-      : `${state.volume.sweeps.length} base tilts · live volume complete`;
+    const currentText = currentScan ? "NOW " + currentScan.label : "waiting for scan";
+    const nextText = nextScan ? " · NEXT " + nextScan.label : "";
+    el("wallStatus").textContent = currentText + nextText;
   } else {
     el("wallStatus").textContent =
-      `${state.volume.sweeps.length} base tilts · ${fmtUtc(state.volume.volume_time)}`;
+      `${panels.length} base tilts · ${fmtUtc(state.volume.volume_time)}`;
   }
 
   renderBoundaries();
@@ -491,8 +589,21 @@ function stepSweep(direction) {
 }
 
 async function setFrame(frame) {
-  const nextFrame = Math.max(0, Math.min(state.maxFrame, Number(frame)));
-  if (nextFrame === state.frame && state.volume) return;
+  await loadHistory();
+
+  if (!state.history.length) {
+    toast("No radar history is available yet.");
+    return;
+  }
+
+  const requested = Number(frame);
+  const nextFrame = Math.max(0, Math.min(state.maxFrame, requested));
+  if (nextFrame === state.frame && state.volume) {
+    if (requested !== nextFrame) {
+      toast(nextFrame === 0 ? "Already at LIVE." : "Oldest cached volume reached.");
+    }
+    return;
+  }
 
   const priorElevation = getSweep()?.elevation ?? null;
   const selectedX = state.point?.x_km;
@@ -504,11 +615,18 @@ async function setFrame(frame) {
   el("emptyState").classList.remove("hidden");
   updateTimeUI();
 
-  await loadVolume(false, priorElevation);
+  await loadVolume(true, priorElevation);
 
   if (selectedX !== undefined && selectedY !== undefined) {
     await inspectAt(selectedX, selectedY, false);
   }
+
+  const meta = currentFrameMeta();
+  toast(
+    nextFrame === 0
+      ? "Returned to LIVE."
+      : `Loaded -${nextFrame}: ${fmtUtc(meta?.volume_time)}`
+  );
 }
 
 async function loadVolume(force = false, priorElevationOverride = null) {
@@ -522,6 +640,7 @@ async function loadVolume(force = false, priorElevationOverride = null) {
     const volume = await json("/api/volume?frame=" + state.frame);
     state.volume = volume;
     fillControls(volume, priorElevation);
+    renderScanSequence();
     renderRadar();
     updateTimeUI();
 
