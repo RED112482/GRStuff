@@ -341,9 +341,20 @@ def _xradar_physical_sequence(tree) -> list[dict[str, Any]]:
         except Exception:
             continue
 
+        scan_time = None
+        try:
+            time_values = np.asarray(ds["time"].values).reshape(-1)
+            if time_values.size:
+                valid_times = time_values[~np.isnat(time_values)]
+                if valid_times.size:
+                    scan_time = np.datetime_as_string(valid_times[0], unit="s") + "Z"
+        except Exception:
+            pass
+
         raw_items.append({
             "group": group,
             "elevation": elevation,
+            "scan_time": scan_time,
             "sails": _bool_attr(ds, "sails_cut"),
             "sails_sequence": _int_attr(ds, "sails_sequence_number"),
             "mrle": _bool_attr(ds, "mrle_cut"),
@@ -380,9 +391,11 @@ def _xradar_physical_sequence(tree) -> list[dict[str, Any]]:
             kind = "BASE"
             sequence_number = 0
 
+        scan_times = [x.get("scan_time") for x in grouped if x.get("scan_time")]
         scans.append({
             "sequence_index": len(scans),
             "elevation": float(item["elevation"]),
+            "scan_time": scan_times[0] if scan_times else None,
             "kind": kind,
             "sequence_number": sequence_number,
             "raw": [x["group"] for x in grouped],
@@ -832,6 +845,325 @@ def _archive_frame(frame: int) -> tuple[Any, dict[str, Any]]:
 
     entry = archive_history[archive_index]
     return _load_archive_radar(entry["key"]), entry
+
+
+def _archive_sequence_for_key(key: str) -> list[dict[str, Any]]:
+    sequence = _xradar_sequence_for_archive(key)
+    if sequence:
+        return sequence
+
+    radar = _load_archive_radar(key)
+    fixed = np.asarray(radar.fixed_angle["data"], dtype=float)
+    items: list[tuple[int, float]] = [
+        (idx, float(elev)) for idx, elev in enumerate(fixed)
+    ]
+
+    scans: list[dict[str, Any]] = []
+    i = 0
+    while i < len(items):
+        raw_idx, elevation = items[i]
+        raw = [raw_idx]
+        j = i + 1
+        while j < len(items) and _angle_matches(items[j][1], elevation):
+            raw.append(items[j][0])
+            j += 1
+
+        scans.append({
+            "sequence_index": len(scans),
+            "elevation": elevation,
+            "scan_time": None,
+            "kind": "BASE",
+            "sequence_number": 0,
+            "raw": [f"/sweep_{idx}" for idx in raw],
+            "split_cut": len(raw) > 1,
+            "base_tilt_cut": False,
+        })
+        i = j
+
+    return scans
+
+
+def _scan_ref(
+    source: str,
+    sequence_index: int,
+    scan: dict[str, Any],
+    archive_key: str | None = None,
+    volume_offset: int = 0,
+    volume_time: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": (
+            f"L:{live_token}:{sequence_index}"
+            if source == "live"
+            else f"A:{archive_key}:{sequence_index}"
+        ),
+        "source": source,
+        "sequence_index": sequence_index,
+        "archive_key": archive_key,
+        "volume_offset": volume_offset,
+        "volume_time": volume_time.isoformat() if volume_time else None,
+        "scan_time": scan.get("scan_time"),
+        "elevation": round(float(scan["elevation"]), 2),
+        "kind": scan.get("kind", "BASE"),
+        "sequence_number": int(scan.get("sequence_number", 0) or 0),
+        "label": _scan_label(scan),
+    }
+
+
+def _scan_history_for_elevation(
+    elevation: float,
+    limit: int = HISTORY_FRAMES,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+
+    with live_lock:
+        tree = live_tree
+        current_live_time = live_volume_time
+
+    if tree is not None:
+        live_sequence = _live_scan_sequence(tree)
+        for scan in reversed(live_sequence):
+            if _angle_matches(scan["elevation"], elevation):
+                results.append(
+                    _scan_ref(
+                        "live",
+                        int(scan["sequence_index"]),
+                        scan,
+                        volume_offset=0,
+                        volume_time=current_live_time,
+                    )
+                )
+                if len(results) >= limit:
+                    return results
+
+    for archive_index, entry in enumerate(archive_history):
+        if current_live_time and entry["volume_time"]:
+            if abs((entry["volume_time"] - current_live_time).total_seconds()) < 30:
+                continue
+
+        sequence = _archive_sequence_for_key(entry["key"])
+        for scan in reversed(sequence):
+            if not _angle_matches(scan["elevation"], elevation):
+                continue
+            results.append(
+                _scan_ref(
+                    "archive",
+                    int(scan["sequence_index"]),
+                    scan,
+                    archive_key=entry["key"],
+                    volume_offset=archive_index + 1,
+                    volume_time=entry["volume_time"],
+                )
+            )
+            if len(results) >= limit:
+                return results
+
+    return results
+
+
+def _expected_base_elevations() -> list[float]:
+    values: list[float] = []
+
+    if archive_history:
+        radar = _load_archive_radar(archive_history[0]["key"])
+        for tilt in _archive_base_tilts(radar):
+            elevation = float(tilt["elevation"])
+            if not any(_angle_matches(elevation, value) for value in values):
+                values.append(elevation)
+
+    with live_lock:
+        tree = live_tree
+    if tree is not None:
+        for scan in _live_scan_sequence(tree):
+            elevation = float(scan["elevation"])
+            if not any(_angle_matches(elevation, value) for value in values):
+                values.append(elevation)
+
+    values.sort()
+    return values[:16]
+
+
+@app.get("/api/elevations")
+def api_elevations() -> dict[str, Any]:
+    elevations = _expected_base_elevations()
+    slots = []
+
+    for index, elevation in enumerate(elevations):
+        history = _scan_history_for_elevation(elevation, limit=1)
+        slots.append({
+            "index": index,
+            "elevation": round(elevation, 2),
+            "latest": history[0] if history else None,
+        })
+
+    with live_lock:
+        tree = live_tree
+
+    scan_sequence = _live_scan_sequence(tree) if tree is not None else []
+    template_sequence: list[dict[str, Any]] = []
+    if archive_history:
+        template_sequence = _archive_sequence_for_key(archive_history[0]["key"])
+
+    return {
+        "slots": slots,
+        "scan_sequence": [
+            _public_scan(scan, _live_tilt_completion(scan))
+            for scan in scan_sequence
+        ],
+        "scan_status": _sequence_status(scan_sequence, template_sequence),
+        "live": tree is not None,
+    }
+
+
+@app.get("/api/scan-history")
+def api_scan_history(
+    elevation: float = Query(..., ge=-1.0, le=30.0),
+    limit: int = Query(HISTORY_FRAMES, ge=1, le=30),
+) -> dict[str, Any]:
+    history = _scan_history_for_elevation(elevation, limit=limit)
+    return {
+        "elevation": round(elevation, 2),
+        "scans": history,
+        "count": len(history),
+    }
+
+
+def _raw_index_from_group(group: str) -> int:
+    match = re.search(r"sweep_(\d+)$", str(group))
+    if not match:
+        raise HTTPException(status_code=500, detail=f"Invalid sweep group: {group}")
+    return int(match.group(1))
+
+
+def _live_scan_arrays(
+    field: str,
+    sequence_index: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    with live_lock:
+        tree = live_tree
+
+    if tree is None:
+        raise HTTPException(status_code=503, detail="Live scan is no longer available.")
+
+    sequence = _live_scan_sequence(tree)
+    if sequence_index < 0 or sequence_index >= len(sequence):
+        raise HTTPException(status_code=404, detail="Live scan is no longer available.")
+
+    scan = sequence[sequence_index]
+    for group in scan["raw"]:
+        ds = tree[group].to_dataset(inherit="all_coords")
+        var_name = _live_field_name(ds, field)
+        if not var_name:
+            continue
+
+        da = ds[var_name]
+        if "range" not in da.dims:
+            continue
+
+        if "azimuth" in da.dims:
+            da = da.transpose("azimuth", "range")
+            azimuths = np.asarray(ds["azimuth"].values, dtype=np.float32)
+        elif "time" in da.dims and "azimuth" in ds.coords:
+            da = da.transpose("time", "range")
+            azimuths = np.asarray(ds["azimuth"].values, dtype=np.float32)
+        else:
+            continue
+
+        data = np.asarray(da.values, dtype=np.float32)
+        ranges_km = np.asarray(ds["range"].values, dtype=np.float32) / 1000.0
+        return data, azimuths, ranges_km, float(scan["elevation"])
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Field '{field}' is not available in that live scan.",
+    )
+
+
+def _archive_scan_arrays(
+    key: str,
+    field: str,
+    sequence_index: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    radar = _load_archive_radar(key)
+    sequence = _archive_sequence_for_key(key)
+    if sequence_index < 0 or sequence_index >= len(sequence):
+        raise HTTPException(status_code=404, detail="Archive scan is not available.")
+
+    scan = sequence[sequence_index]
+    for group in scan["raw"]:
+        raw_sweep = _raw_index_from_group(group)
+        if field not in radar.fields:
+            break
+        try:
+            data_ma = radar.get_field(raw_sweep, field, copy=False)
+        except Exception:
+            continue
+        if np.ma.count(data_ma) <= 0:
+            continue
+
+        data = np.asarray(np.ma.filled(data_ma, np.nan), dtype=np.float32)
+        sweep_slice = radar.get_slice(raw_sweep)
+        azimuths = np.asarray(radar.azimuth["data"][sweep_slice], dtype=np.float32)
+        ranges_km = np.asarray(radar.range["data"], dtype=np.float32) / 1000.0
+        return data, azimuths, ranges_km, float(scan["elevation"])
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Field '{field}' is not available in that archive scan.",
+    )
+
+
+@app.get("/api/scan-image/{field}.png")
+def api_scan_image(
+    field: str,
+    source: str = Query(..., pattern="^(live|archive)$"),
+    sequence_index: int = Query(..., ge=0),
+    archive_key: str | None = Query(None),
+    range_km: float = Query(DEFAULT_RANGE_KM, ge=25, le=460),
+    smooth: bool = Query(True),
+    size: int = Query(RASTER_SIZE, ge=180, le=900),
+) -> Response:
+    if field not in FIELD_CONFIG:
+        raise HTTPException(status_code=404, detail=f"Unknown field '{field}'.")
+
+    if source == "live":
+        data, azimuths, ranges_km, _ = _live_scan_arrays(field, sequence_index)
+        source_key = live_token or "live"
+    else:
+        if not archive_key:
+            raise HTTPException(status_code=400, detail="archive_key is required.")
+        data, azimuths, ranges_km, _ = _archive_scan_arrays(
+            archive_key,
+            field,
+            sequence_index,
+        )
+        source_key = archive_key
+
+    cache_key = (
+        "scan",
+        source,
+        source_key,
+        sequence_index,
+        field,
+        round(range_km, 1),
+        smooth,
+        size,
+    )
+    png = _render_array_png(
+        data,
+        azimuths,
+        ranges_km,
+        field,
+        range_km,
+        smooth,
+        size,
+        cache_key,
+    )
+    return Response(
+        png,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 def _live_field_name(ds, field: str) -> str | None:
