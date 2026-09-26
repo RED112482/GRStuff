@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import zipfile
@@ -32,6 +33,10 @@ import pyqtgraph as pg
 RADAR_ID = os.getenv("RADAR_ID", "KMOB").upper()
 ARCHIVE_BUCKET = os.getenv("NEXRAD_BUCKET", "unidata-nexrad-level2")
 CHUNK_BUCKET = os.getenv("NEXRAD_CHUNK_BUCKET", "unidata-nexrad-level2-chunks")
+TGFTP_BASE = os.getenv(
+    "NEXRAD_TGFTP_BASE",
+    "https://tgftp.nws.noaa.gov/data/radar/nexrad_level2",
+)
 POLL_SECONDS = float(os.getenv("DESKTOP_POLL_SECONDS", "2"))
 DEFAULT_RANGE_KM = float(os.getenv("DEFAULT_RANGE_KM", "150"))
 HISTORY_PER_ELEVATION = int(os.getenv("DESKTOP_HISTORY_SCANS", "14"))
@@ -356,6 +361,7 @@ _RENDER_GRID_CACHE: OrderedDict[
     tuple[np.ndarray, np.ndarray],
 ] = OrderedDict()
 _SCAN_SORT_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+_RENDER_CACHE_LOCK = threading.RLock()
 
 
 def _render_grid(
@@ -372,10 +378,11 @@ def _render_grid(
         int(width),
         int(height),
     )
-    cached = _RENDER_GRID_CACHE.get(key)
-    if cached is not None:
-        _RENDER_GRID_CACHE.move_to_end(key)
-        return cached
+    with _RENDER_CACHE_LOCK:
+        cached = _RENDER_GRID_CACHE.get(key)
+        if cached is not None:
+            _RENDER_GRID_CACHE.move_to_end(key)
+            return cached
 
     xs = np.linspace(x_range[0], x_range[1], width, dtype=np.float32)
     ys = np.linspace(y_range[0], y_range[1], height, dtype=np.float32)
@@ -385,10 +392,11 @@ def _render_grid(
         np.float32
     )
 
-    _RENDER_GRID_CACHE[key] = (rr, az)
-    _RENDER_GRID_CACHE.move_to_end(key)
-    while len(_RENDER_GRID_CACHE) > 12:
-        _RENDER_GRID_CACHE.popitem(last=False)
+    with _RENDER_CACHE_LOCK:
+        _RENDER_GRID_CACHE[key] = (rr, az)
+        _RENDER_GRID_CACHE.move_to_end(key)
+        while len(_RENDER_GRID_CACHE) > 12:
+            _RENDER_GRID_CACHE.popitem(last=False)
     return rr, az
 
 
@@ -423,11 +431,13 @@ def render_scan(
     choose_lower = np.abs(rr - ranges[lower_gate]) < np.abs(rr - ranges[gate])
     gate = np.where(choose_lower, lower_gate, gate)
 
-    cached_sort = _SCAN_SORT_CACHE.get(scan.scan_id)
+    with _RENDER_CACHE_LOCK:
+        cached_sort = _SCAN_SORT_CACHE.get(scan.scan_id)
     if cached_sort is None:
         order = np.argsort(scan.azimuth)
         az_sorted = np.ascontiguousarray(scan.azimuth[order])
-        _SCAN_SORT_CACHE[scan.scan_id] = (order, az_sorted)
+        with _RENDER_CACHE_LOCK:
+            _SCAN_SORT_CACHE[scan.scan_id] = (order, az_sorted)
     else:
         order, az_sorted = cached_sort
     data_sorted = scan.reflectivity[order]
@@ -457,6 +467,54 @@ def render_scan(
     sampled = np.asarray(sampled, dtype=np.float32)
     sampled[rr > ranges[-1]] = np.nan
     return np.ascontiguousarray(sampled)
+
+
+class RenderTaskSignals(QtCore.QObject):
+    finished = QtCore.Signal(object, object, object)
+    failed = QtCore.Signal(object, str)
+
+
+class RenderTask(QtCore.QRunnable):
+    def __init__(
+        self,
+        signature: tuple[Any, ...],
+        scan: RadarScan,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        width: int,
+        height: int,
+    ):
+        super().__init__()
+        self.signature = signature
+        self.scan = scan
+        self.x_range = x_range
+        self.y_range = y_range
+        self.width = width
+        self.height = height
+        self.signals = RenderTaskSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            image = render_scan(
+                self.scan,
+                self.x_range,
+                self.y_range,
+                self.width,
+                self.height,
+            )
+            rect = (
+                self.x_range[0],
+                self.y_range[0],
+                self.x_range[1] - self.x_range[0],
+                self.y_range[1] - self.y_range[0],
+            )
+            self.signals.finished.emit(self.signature, image, rect)
+        except Exception as exc:
+            self.signals.failed.emit(
+                self.signature,
+                f"{type(exc).__name__}: {exc}",
+            )
 
 
 class RadarDataWorker(QtCore.QThread):
@@ -554,43 +612,109 @@ class RadarDataWorker(QtCore.QThread):
         found.sort(reverse=True)
         return [key for _, key in found[:ARCHIVE_VOLUMES]]
 
+    def _recent_tgftp_files(self) -> list[str]:
+        url = f"{TGFTP_BASE}/{RADAR_ID}/dir.list"
+        with urllib.request.urlopen(url, timeout=6) as response:
+            text = response.read().decode("utf-8", errors="replace")
+
+        names: list[str] = []
+        for line in text.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            name = parts[-1]
+            if name.startswith(f"{RADAR_ID}_") and name.endswith(".bz2"):
+                names.append(name)
+        return names[-ARCHIVE_VOLUMES:]
+
+    def _download_tgftp_file(self, name: str) -> Path:
+        path = CACHE_DIR / name
+        if path.exists() and path.stat().st_size > 0:
+            return path
+
+        url = f"{TGFTP_BASE}/{RADAR_ID}/{name}"
+        tmp = path.with_suffix(path.suffix + ".part")
+        with urllib.request.urlopen(url, timeout=20) as response:
+            with open(tmp, "wb") as handle:
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    handle.write(block)
+        tmp.replace(path)
+        return path
+
+
     def _archive_path(self, key: str) -> Path:
         return CACHE_DIR / key.rsplit("/", 1)[-1]
 
     def _bootstrap_archive(self):
-        keys = self._recent_archive_keys()
-        if not keys:
-            self.status.emit("No recent completed KMOB volume found.")
-            return
+        loaded_any = False
 
-        for idx, key in enumerate(reversed(keys)):
-            if not self._running:
-                return
-            path = self._archive_path(key)
-            if not path.exists():
-                self.status.emit(f"Downloading archive volume {idx + 1}/{len(keys)}…")
-                self.archive_s3.download_file(
-                    ARCHIVE_BUCKET,
-                    key,
-                    str(path),
-                )
-
-            tree = xd.io.open_nexradlevel2_datatree(
-                str(path),
-                incomplete_sweep="drop",
+        # Prefer the NWS direct Level-II directory for recent completed-volume
+        # history.  Its dir.list is tiny and avoids scanning an entire S3 day.
+        try:
+            names = self._recent_tgftp_files()
+            if names:
+                for idx, name in enumerate(names):
+                    if not self._running:
+                        return
+                    self.status.emit(
+                        f"Loading NWS Level-II history {idx + 1}/{len(names)}…"
+                    )
+                    path = self._download_tgftp_file(name)
+                    tree = xd.io.open_nexradlevel2_datatree(
+                        str(path),
+                        incomplete_sweep="drop",
+                    )
+                    if self.site_lat is None or self.site_lon is None:
+                        self.site_lat, self.site_lon = _tree_site_location(tree)
+                    scans = _extract_scans(tree, name, "archive")
+                    self._merge_scans(scans)
+                    self.expected_sequence = list(scans)
+                    self.strategy = _scan_strategy(tree)
+                    loaded_any = loaded_any or bool(scans)
+        except Exception as exc:
+            self.status.emit(
+                f"NWS direct history unavailable · using AWS archive "
+                f"({type(exc).__name__}: {exc})"
             )
-            if self.site_lat is None or self.site_lon is None:
-                self.site_lat, self.site_lon = _tree_site_location(tree)
-            scans = _extract_scans(tree, key, "archive")
-            self._merge_scans(scans)
-            # The loop runs oldest -> newest, so these end as the most recent
-            # completed-volume template and scan-strategy metadata.
-            self.expected_sequence = list(scans)
-            self.strategy = _scan_strategy(tree)
 
-        self.status.emit("Archive ready · connecting live chunks…")
+        if not loaded_any:
+            keys = self._recent_archive_keys()
+            if not keys:
+                self.status.emit("No recent completed KMOB volume found.")
+                return
+
+            for idx, key in enumerate(reversed(keys)):
+                if not self._running:
+                    return
+                path = self._archive_path(key)
+                if not path.exists():
+                    self.status.emit(
+                        f"Downloading AWS archive volume {idx + 1}/{len(keys)}…"
+                    )
+                    self.archive_s3.download_file(
+                        ARCHIVE_BUCKET,
+                        key,
+                        str(path),
+                    )
+
+                tree = xd.io.open_nexradlevel2_datatree(
+                    str(path),
+                    incomplete_sweep="drop",
+                )
+                if self.site_lat is None or self.site_lon is None:
+                    self.site_lat, self.site_lon = _tree_site_location(tree)
+                scans = _extract_scans(tree, key, "archive")
+                self._merge_scans(scans)
+                self.expected_sequence = list(scans)
+                self.strategy = _scan_strategy(tree)
+
+        self.status.emit("History ready · connecting live chunks…")
         self._emit_snapshot()
         self._load_boundaries()
+
 
     def _load_boundaries(self):
         if self._boundaries_loaded:
@@ -809,6 +933,7 @@ class RadarCanvas(QtWidgets.QWidget):
         self.is_scanning = False
         self._rerendering = False
         self._last_render_signature: tuple[Any, ...] | None = None
+        self._pending_render_signature: tuple[Any, ...] | None = None
 
         self.view_box = RadarViewBox()
         self.plot = pg.PlotWidget(viewBox=self.view_box)
@@ -855,15 +980,48 @@ class RadarCanvas(QtWidgets.QWidget):
             True,
         )
         self.badge.setStyleSheet(
-            "QLabel { background: rgba(4,8,13,190); color: #9fb0c5; "
-            "padding: 3px 5px; border-radius: 4px; }"
+            "QLabel { background: rgba(4,8,13,210); color: #9fb0c5; "
+            "padding: 4px 6px; border-radius: 4px; font-weight: 700; }"
         )
+
+        self.time_badge = QtWidgets.QLabel("—")
+        self.time_badge.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.time_badge.setStyleSheet(
+            "QLabel { background: rgba(4,8,13,210); color: #eef4fb; "
+            "padding: 4px 6px; border-radius: 4px; font-weight: 700; }"
+        )
+
+        self.scan_badge = QtWidgets.QLabel("")
+        self.scan_badge.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.scan_badge.setStyleSheet(
+            "QLabel { background: rgba(4,8,13,220); color: #ffb547; "
+            "padding: 4px 6px; border-radius: 4px; font-weight: 800; }"
+        )
+        self.scan_badge.hide()
 
         overlay = QtWidgets.QGridLayout()
         overlay.setContentsMargins(6, 6, 6, 6)
         overlay.addWidget(self.title, 0, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         overlay.addWidget(self.badge, 0, 1, QtCore.Qt.AlignmentFlag.AlignRight)
         overlay.setRowStretch(1, 1)
+        overlay.addWidget(
+            self.time_badge,
+            2,
+            0,
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom,
+        )
+        overlay.addWidget(
+            self.scan_badge,
+            2,
+            1,
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom,
+        )
 
         stack = QtWidgets.QStackedLayout(self)
         stack.setStackingMode(QtWidgets.QStackedLayout.StackingMode.StackAll)
@@ -914,14 +1072,22 @@ class RadarCanvas(QtWidgets.QWidget):
         if scan is None:
             self.title.setText("—")
             self.badge.setText("NO SCAN")
+            self.time_badge.setText("—")
+            self.scan_badge.hide()
             self.image.clear()
             self._last_render_signature = None
+            self._pending_render_signature = None
             return
 
         self.title.setText(
             f"{scan.elevation:.2f}°"
-            + (f" · {scan.kind} #{scan.sequence_number}" if scan.kind != "BASE" else "")
+            + (
+                f" · {scan.kind} #{scan.sequence_number}"
+                if scan.kind != "BASE"
+                else " · BASE"
+            )
         )
+        self.time_badge.setText(scan.scan_time.strftime("%H:%M:%SZ"))
         if prior_id != scan.scan_id:
             self._last_render_signature = None
         self.update_age_badge(current_live_volume)
@@ -940,29 +1106,36 @@ class RadarCanvas(QtWidgets.QWidget):
         elif age_seconds < 3600:
             age_text = f"{age_seconds // 60}m {age_seconds % 60:02d}s"
         else:
-            age_text = f"{age_seconds // 3600}h {(age_seconds % 3600) // 60:02d}m"
+            age_text = (
+                f"{age_seconds // 3600}h "
+                f"{(age_seconds % 3600) // 60:02d}m"
+            )
 
         if self.is_scanning:
-            dot = "<span style='color:#ffb547'>●</span>"
-            status = "SCANNING…"
-            color = "#ffcb7a"
+            status = "● SCANNING"
+            color = "#ffb547"
+            self.scan_badge.setText("SCANNING…")
+            self.scan_badge.show()
         elif self.is_latest:
-            dot = "<span style='color:#35d07f'>●</span>"
-            status = "LATEST"
-            color = "#bff7d5"
+            status = "● LATEST"
+            color = "#35d07f"
+            self.scan_badge.hide()
         else:
-            dot = "<span style='color:#ff5b69'>●</span>"
-            status = "OLDER"
-            color = "#ff9ca5"
+            status = "● OLDER"
+            color = "#ff5b69"
+            self.scan_badge.hide()
 
         live_suffix = ""
         if scan.source == "live" and scan.volume_id == current_live_volume:
             live_suffix = " · LIVE"
 
-        self.badge.setText(
-            f"{dot} <span style='color:{color}'>{status}</span>"
-            f" · {age_text}{live_suffix}"
+        self.badge.setText(f"{status} · {age_text}{live_suffix}")
+        self.badge.setStyleSheet(
+            "QLabel { background: rgba(4,8,13,220); "
+            f"color: {color}; padding: 4px 6px; border-radius: 4px; "
+            "font-weight: 800; }"
         )
+
 
     def set_interaction_mode(self, mode: str):
         self.view_box.set_interaction_mode(mode)
@@ -998,15 +1171,15 @@ class RadarCanvas(QtWidgets.QWidget):
             (-DEFAULT_RANGE_KM, DEFAULT_RANGE_KM),
         )
 
-    def rerender(self):
+    def _render_spec(self):
         if self.scan is None:
-            return
+            return None
 
         x_range, y_range = self.visible_ranges()
         size = self.plot.viewport().size()
         if self.compact:
-            width = max(140, min(size.width(), 200))
-            height = max(140, min(size.height(), 200))
+            width = max(128, min(size.width(), 190))
+            height = max(128, min(size.height(), 190))
         else:
             width = max(350, min(size.width(), 1000))
             height = max(350, min(size.height(), 1000))
@@ -1021,29 +1194,56 @@ class RadarCanvas(QtWidgets.QWidget):
             int(width),
             int(height),
         )
-        if signature == self._last_render_signature:
+        return signature, x_range, y_range, width, height
+
+    def request_rerender(
+        self,
+        pool: QtCore.QThreadPool,
+        priority: int = 0,
+    ):
+        spec = self._render_spec()
+        if spec is None:
             return
 
-        image = render_scan(
+        signature, x_range, y_range, width, height = spec
+        if signature == self._last_render_signature:
+            return
+        if signature == self._pending_render_signature:
+            return
+
+        self._pending_render_signature = signature
+        task = RenderTask(
+            signature,
             self.scan,
             x_range,
             y_range,
             width,
             height,
         )
-        rect = QtCore.QRectF(
-            x_range[0],
-            y_range[0],
-            x_range[1] - x_range[0],
-            y_range[1] - y_range[0],
-        )
+        task.signals.finished.connect(self._apply_render_result)
+        task.signals.failed.connect(self._render_failed)
+        pool.start(task, priority)
+
+    @QtCore.Slot(object, object, object)
+    def _apply_render_result(self, signature, image, rect):
+        if signature != self._pending_render_signature:
+            return
         self.image.setImage(
             image,
             autoLevels=False,
             levels=(-10, 80),
         )
-        self.image.setRect(rect)
+        self.image.setRect(QtCore.QRectF(*rect))
         self._last_render_signature = signature
+        self._pending_render_signature = None
+
+    @QtCore.Slot(object, str)
+    def _render_failed(self, signature, message: str):
+        if signature == self._pending_render_signature:
+            self._pending_render_signature = None
+        print(f"[RENDER ERROR] {message}", flush=True)
+
+
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1071,6 +1271,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._syncing_ranges = False
         self._wall_mode = False
+
+        self.render_pool = QtCore.QThreadPool(self)
+        cpu_count = os.cpu_count() or 4
+        self.render_pool.setMaxThreadCount(max(2, min(6, cpu_count - 1)))
 
         # Range-change signals can fire while widgets are being constructed,
         # so create the debounce timer before _build_ui() connects any view.
@@ -1197,10 +1401,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.elev_combo.currentIndexChanged.connect(self._combo_changed)
 
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Up), self).activated.connect(
-            lambda: self._pan_vertical(1)
+            self._keyboard_up
         )
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Down), self).activated.connect(
-            lambda: self._pan_vertical(-1)
+            self._keyboard_down
         )
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_PageUp), self).activated.connect(
             lambda: self._step_elevation(1)
@@ -1244,6 +1448,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self.worker.stop()
         self.worker.wait(2500)
+        self.render_pool.clear()
+        self.render_pool.waitForDone(1500)
         super().closeEvent(event)
 
     def _set_status(self, text: str):
@@ -1466,11 +1672,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.future_btn.setEnabled(self.anchor_index > 0)
 
     def _rerender_visible(self):
-        self.single.rerender()
+        # Keep the primary pane responsive by giving it higher queue priority.
+        self.single.request_rerender(self.render_pool, priority=10)
         if self._wall_mode:
             for canvas in self.wall_canvases:
                 if canvas.scan is not None:
-                    canvas.rerender()
+                    canvas.request_rerender(self.render_pool, priority=0)
 
     def _view_changed(self, source: RadarCanvas):
         if self._syncing_ranges or not hasattr(self, "render_timer"):
@@ -1542,6 +1749,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._resolve_wall()
         self._render_all()
+
+    def _keyboard_up(self):
+        if self._wall_mode:
+            self._pan_vertical(1)
+        else:
+            self._step_elevation(1)
+
+    def _keyboard_down(self):
+        if self._wall_mode:
+            self._pan_vertical(-1)
+        else:
+            self._step_elevation(-1)
+
 
     def _pan_vertical(self, direction: int):
         x_range, y_range = self.single.visible_ranges()
