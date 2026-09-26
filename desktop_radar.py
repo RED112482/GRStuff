@@ -14,11 +14,15 @@ from typing import Any
 
 import boto3
 import numpy as np
-import pyqtgraph as pg
 import xradar as xd
 from botocore import UNSIGNED
 from botocore.config import Config
+
+# Lock PyQtGraph to PySide6 before importing pyqtgraph.  This avoids binding
+# auto-detection ambiguity and surfaces the real Qt import error on Windows.
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 from PySide6 import QtCore, QtGui, QtWidgets
+import pyqtgraph as pg
 
 
 RADAR_ID = os.getenv("RADAR_ID", "KMOB").upper()
