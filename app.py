@@ -78,6 +78,7 @@ image_cache: dict[tuple[Any, ...], bytes] = {}
 image_cache_lock = threading.RLock()
 archive_history: list[dict[str, Any]] = []
 archive_radar_cache: OrderedDict[str, Any] = OrderedDict()
+archive_sequence_cache: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 archive_lock = threading.RLock()
 
 live_lock = threading.RLock()
@@ -406,6 +407,12 @@ def _xradar_sequence_for_archive(key: str) -> list[dict[str, Any]]:
     if not XRADAR_AVAILABLE:
         return []
 
+    with archive_lock:
+        cached = archive_sequence_cache.get(key)
+        if cached is not None:
+            archive_sequence_cache.move_to_end(key)
+            return cached
+
     local_path = _archive_local_path(key)
     if not local_path.exists():
         s3.download_file(BUCKET, key, str(local_path))
@@ -415,7 +422,13 @@ def _xradar_sequence_for_archive(key: str) -> list[dict[str, Any]]:
             str(local_path),
             incomplete_sweep="drop",
         )
-        return _xradar_physical_sequence(tree)
+        sequence = _xradar_physical_sequence(tree)
+        with archive_lock:
+            archive_sequence_cache[key] = sequence
+            archive_sequence_cache.move_to_end(key)
+            while len(archive_sequence_cache) > 5:
+                archive_sequence_cache.popitem(last=False)
+        return sequence
     except Exception as exc:
         print(f"[SEQUENCE TEMPLATE ERROR] {type(exc).__name__}: {exc}", flush=True)
         return []
