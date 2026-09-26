@@ -94,8 +94,21 @@ live_error: str | None = None
 boundary_cache: dict[str, Any] = {}
 boundary_lock = threading.RLock()
 
-s3 = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
-s3_chunks = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
+s3 = boto3.client(
+    "s3",
+    region_name="us-east-1",
+    config=Config(signature_version=UNSIGNED),
+)
+s3_chunks = boto3.client(
+    "s3",
+    region_name="us-east-1",
+    config=Config(
+        signature_version=UNSIGNED,
+        connect_timeout=3,
+        read_timeout=6,
+        retries={"max_attempts": 2, "mode": "standard"},
+    ),
+)
 app = FastAPI(title="KMOB Level-II Volume Explorer", version="0.3.0")
 
 
@@ -473,7 +486,22 @@ def _live_base_tilts(tree=None) -> list[dict[str, Any]]:
     return _base_tilts_from_sequence(_live_scan_sequence(tree))
 
 
+def _chunk_prefix_sort_key(prefix: str) -> tuple[int, str]:
+    """Match the chunk-bucket directory ordering used by Xradar's example."""
+    leaf = prefix.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return int(leaf), prefix
+    except ValueError:
+        return -1, prefix
+
+
 def _chunk_volume_prefix_and_keys() -> tuple[str | None, list[dict[str, Any]]]:
+    """Return the newest KMOB real-time chunk directory with O(1) S3 listings.
+
+    The chunk bucket is organized as RADAR/<volume-directory>/chunk-files.
+    Do not probe every directory individually; that turns one refresh into
+    hundreds of S3 requests and can block startup for minutes.
+    """
     if not XRADAR_AVAILABLE:
         return None, []
 
@@ -482,23 +510,31 @@ def _chunk_volume_prefix_and_keys() -> tuple[str | None, list[dict[str, Any]]]:
         Bucket=CHUNK_BUCKET,
         Prefix=root,
         Delimiter="/",
+        MaxKeys=1000,
     )
     prefixes = [item["Prefix"] for item in response.get("CommonPrefixes", [])]
-
-    candidates: list[tuple[datetime, str, list[dict[str, Any]]]] = []
-    for prefix in prefixes:
-        listing = s3_chunks.list_objects_v2(Bucket=CHUNK_BUCKET, Prefix=prefix)
-        objects = listing.get("Contents", [])
-        if not objects:
-            continue
-        newest = max(obj["LastModified"] for obj in objects)
-        candidates.append((newest, prefix, objects))
-
-    if not candidates:
+    if not prefixes:
         return None, []
 
-    _, prefix, objects = max(candidates, key=lambda item: item[0])
-    objects.sort(key=lambda obj: obj["Key"])
+    # Xradar's documented real-time example sorts these station directories
+    # and opens the last one. Numeric sorting avoids lexical 99/100 issues.
+    prefix = max(prefixes, key=_chunk_prefix_sort_key)
+
+    listing = s3_chunks.list_objects_v2(
+        Bucket=CHUNK_BUCKET,
+        Prefix=prefix,
+        MaxKeys=1000,
+    )
+    objects = listing.get("Contents", [])
+    if not objects:
+        return None, []
+
+    def chunk_order(obj: dict[str, Any]) -> tuple[int, str]:
+        name = obj["Key"].rsplit("/", 1)[-1]
+        match = re.search(r"-(\d+)-(?:S|I|E)$", name)
+        return (int(match.group(1)) if match else 999999, name)
+
+    objects.sort(key=chunk_order)
     return prefix, objects
 
 
@@ -592,12 +628,18 @@ def refresh_live_chunks() -> bool:
 
 
 async def poll_loop() -> None:
-    archive_counter = 0
+    archive_counter = max(1, int(10 / max(POLL_SECONDS, 1)))
     while True:
-        await asyncio.to_thread(refresh_live_chunks)
+        try:
+            await asyncio.to_thread(refresh_live_chunks)
+        except Exception as exc:
+            print(f"[LIVE LOOP ERROR] {type(exc).__name__}: {exc}", flush=True)
 
         if archive_counter <= 0:
-            await asyncio.to_thread(refresh_archive_history)
+            try:
+                await asyncio.to_thread(refresh_archive_history)
+            except Exception as exc:
+                print(f"[ARCHIVE LOOP ERROR] {type(exc).__name__}: {exc}", flush=True)
             archive_counter = max(1, int(10 / max(POLL_SECONDS, 1)))
         else:
             archive_counter -= 1
@@ -607,8 +649,10 @@ async def poll_loop() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    # Bring up the application from the completed-volume archive first.
+    # Live chunk discovery runs in the background and must never block Uvicorn
+    # startup or prevent the user interface from loading.
     await asyncio.to_thread(refresh_archive_history)
-    await asyncio.to_thread(refresh_live_chunks)
     asyncio.create_task(poll_loop())
 
 
