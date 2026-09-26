@@ -6,6 +6,8 @@ import re
 import sys
 import tempfile
 import time
+import urllib.request
+import zipfile
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,9 @@ from typing import Any
 
 import boto3
 import numpy as np
+import shapefile
 import xradar as xd
+from pyproj import CRS, Transformer
 from botocore import UNSIGNED
 from botocore.config import Config
 
@@ -40,6 +44,13 @@ CACHE_DIR = Path(
     )
 )
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+BOUNDARY_DIR = CACHE_DIR / "boundaries"
+BOUNDARY_DIR.mkdir(parents=True, exist_ok=True)
+
+BOUNDARY_URLS = {
+    "state": "https://www2.census.gov/geo/tiger/GENZ2025/shp/cb_2025_us_state_5m.zip",
+    "county": "https://www2.census.gov/geo/tiger/GENZ2025/shp/cb_2025_us_county_5m.zip",
+}
 
 pg.setConfigOption("imageAxisOrder", "row-major")
 pg.setConfigOption("antialias", False)
@@ -202,6 +213,90 @@ def _extract_scans(tree, volume_id: str, source: str) -> list[RadarScan]:
     return scans
 
 
+def _tree_site_location(tree) -> tuple[float, float]:
+    root = tree["/"].to_dataset()
+    lat = float(np.asarray(root["latitude"].values).reshape(-1)[0])
+    lon = float(np.asarray(root["longitude"].values).reshape(-1)[0])
+    return lat, lon
+
+
+def _ensure_boundary_shapefile(kind: str) -> Path:
+    target_dir = BOUNDARY_DIR / kind
+    target_dir.mkdir(parents=True, exist_ok=True)
+    shp_files = list(target_dir.glob("*.shp"))
+    if shp_files:
+        return shp_files[0]
+
+    zip_path = BOUNDARY_DIR / f"{kind}.zip"
+    urllib.request.urlretrieve(BOUNDARY_URLS[kind], zip_path)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(target_dir)
+
+    shp_files = list(target_dir.glob("*.shp"))
+    if not shp_files:
+        raise RuntimeError(f"No {kind} shapefile found after extraction.")
+    return shp_files[0]
+
+
+def _boundary_xy(
+    kind: str,
+    radar_lat: float,
+    radar_lon: float,
+    max_range_km: float = 420.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    shp_path = _ensure_boundary_shapefile(kind)
+    reader = shapefile.Reader(str(shp_path))
+
+    local_crs = CRS.from_proj4(
+        f"+proj=aeqd +lat_0={radar_lat} +lon_0={radar_lon} "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+    transformer = Transformer.from_crs(
+        "EPSG:4326",
+        local_crs,
+        always_xy=True,
+    )
+
+    xs: list[float] = []
+    ys: list[float] = []
+    limit_m = max_range_km * 1000.0
+
+    for shape in reader.shapes():
+        points = shape.points
+        if not points:
+            continue
+        parts = list(shape.parts) + [len(points)]
+        for start, stop in zip(parts[:-1], parts[1:]):
+            segment = points[start:stop]
+            if len(segment) < 2:
+                continue
+
+            lon = np.asarray([p[0] for p in segment], dtype=np.float64)
+            lat = np.asarray([p[1] for p in segment], dtype=np.float64)
+            x_m, y_m = transformer.transform(lon, lat)
+
+            x_m = np.asarray(x_m)
+            y_m = np.asarray(y_m)
+            keep = (
+                (x_m >= -limit_m)
+                & (x_m <= limit_m)
+                & (y_m >= -limit_m)
+                & (y_m <= limit_m)
+            )
+            if not np.any(keep):
+                continue
+
+            xs.extend((x_m / 1000.0).tolist())
+            ys.extend((y_m / 1000.0).tolist())
+            xs.append(np.nan)
+            ys.append(np.nan)
+
+    return (
+        np.ascontiguousarray(xs, dtype=np.float32),
+        np.ascontiguousarray(ys, dtype=np.float32),
+    )
+
+
 def _canonical_elevation(existing: list[float], value: float) -> float:
     for current in existing:
         if abs(current - value) <= 0.07:
@@ -347,6 +442,7 @@ def render_scan(
 class RadarDataWorker(QtCore.QThread):
     snapshot = QtCore.Signal(object)
     status = QtCore.Signal(str)
+    boundaries = QtCore.Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -354,6 +450,9 @@ class RadarDataWorker(QtCore.QThread):
         self.histories: dict[float, list[RadarScan]] = defaultdict(list)
         self.current_live_volume: str | None = None
         self.live_sequence: list[RadarScan] = []
+        self.site_lat: float | None = None
+        self.site_lon: float | None = None
+        self._boundaries_loaded = False
         self._chunk_bytes: dict[str, bytes] = {}
 
         self.archive_s3 = boto3.client(
@@ -452,11 +551,45 @@ class RadarDataWorker(QtCore.QThread):
                 str(path),
                 incomplete_sweep="drop",
             )
+            if self.site_lat is None or self.site_lon is None:
+                self.site_lat, self.site_lon = _tree_site_location(tree)
+                self._load_boundaries()
             scans = _extract_scans(tree, key, "archive")
             self._merge_scans(scans)
 
         self.status.emit("Archive ready · connecting live chunks…")
         self._emit_snapshot()
+
+    def _load_boundaries(self):
+        if self._boundaries_loaded:
+            return
+        if self.site_lat is None or self.site_lon is None:
+            return
+
+        try:
+            self.status.emit("Loading state/county outlines…")
+            state_xy = _boundary_xy(
+                "state",
+                self.site_lat,
+                self.site_lon,
+            )
+            county_xy = _boundary_xy(
+                "county",
+                self.site_lat,
+                self.site_lon,
+            )
+            self.boundaries.emit(
+                {
+                    "state": state_xy,
+                    "county": county_xy,
+                }
+            )
+            self._boundaries_loaded = True
+        except Exception as exc:
+            self.status.emit(
+                f"Boundary load: {type(exc).__name__}: {exc}"
+            )
+
 
     def _latest_chunk_prefix(self) -> str | None:
         root = f"{RADAR_ID}/"
@@ -583,7 +716,7 @@ class RadarViewBox(pg.ViewBox):
             enableMenu=False,
             defaultPadding=0.0,
         )
-        self.setMouseMode(pg.ViewBox.RectMode)
+        self.setMouseMode(pg.ViewBox.PanMode)
         self.setLimits(
             xMin=-500,
             xMax=500,
@@ -599,14 +732,6 @@ class RadarViewBox(pg.ViewBox):
         super().mouseClickEvent(ev)
 
     def mouseDragEvent(self, ev, axis=None):
-        if ev.button() == QtCore.Qt.MouseButton.RightButton:
-            ev.accept()
-            delta = ev.pos() - ev.lastPos()
-            delta = self.mapSceneToView(ev.scenePos()) - self.mapSceneToView(
-                ev.scenePos() - delta
-            )
-            self.translateBy(x=-delta.x(), y=-delta.y())
-            return
         super().mouseDragEvent(ev, axis=axis)
 
     def mouseDoubleClickEvent(self, ev):
@@ -637,6 +762,21 @@ class RadarCanvas(QtWidgets.QWidget):
         self.image.setLevels((-10, 80))
         self.image.setAutoDownsample(True)
         self.view_box.addItem(self.image)
+
+        self.county_item = pg.PlotDataItem(
+            pen=pg.mkPen((225, 230, 238, 95), width=0.7),
+            connect="finite",
+            antialias=False,
+        )
+        self.state_item = pg.PlotDataItem(
+            pen=pg.mkPen((255, 255, 255, 205), width=1.35),
+            connect="finite",
+            antialias=False,
+        )
+        self.county_item.setZValue(20)
+        self.state_item.setZValue(21)
+        self.view_box.addItem(self.county_item)
+        self.view_box.addItem(self.state_item)
 
         self.title = QtWidgets.QLabel("—")
         self.title.setAttribute(
@@ -680,6 +820,23 @@ class RadarCanvas(QtWidgets.QWidget):
         self.view_box.sigRangeChanged.connect(
             lambda *_: self.range_changed.emit(self)
         )
+
+    def set_boundaries(self, data: dict[str, tuple[np.ndarray, np.ndarray]]):
+        county = data.get("county")
+        state = data.get("state")
+        if county is not None:
+            self.county_item.setData(
+                county[0],
+                county[1],
+                connect="finite",
+            )
+        if state is not None:
+            self.state_item.setData(
+                state[0],
+                state[1],
+                connect="finite",
+            )
+
 
     def set_scan(self, scan: RadarScan | None, current_live_volume: str | None):
         self.scan = scan
@@ -772,6 +929,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.histories: dict[float, list[RadarScan]] = {}
         self.live_sequence: list[RadarScan] = []
         self.live_volume: str | None = None
+        self.boundary_data: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
 
         self.anchor_elevation: float | None = None
         self.anchor_index = 0
@@ -793,6 +951,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = RadarDataWorker()
         self.worker.snapshot.connect(self._apply_snapshot)
         self.worker.status.connect(self._set_status)
+        self.worker.boundaries.connect(self._apply_boundaries)
         self.worker.start()
 
     def _build_ui(self):
@@ -877,9 +1036,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.elev_combo.currentIndexChanged.connect(self._combo_changed)
 
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Up), self).activated.connect(
-            lambda: self._step_elevation(1)
+            lambda: self._pan_vertical(1)
         )
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Down), self).activated.connect(
+            lambda: self._pan_vertical(-1)
+        )
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_PageUp), self).activated.connect(
+            lambda: self._step_elevation(1)
+        )
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_PageDown), self).activated.connect(
             lambda: self._step_elevation(-1)
         )
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Left), self).activated.connect(
@@ -917,6 +1082,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_status(self, text: str):
         self.status_label.setText(text)
+
+    def _apply_boundaries(self, data):
+        self.boundary_data = data
+        self.single.set_boundaries(data)
+        for canvas in self.wall_canvases:
+            canvas.set_boundaries(data)
+
 
     def _apply_snapshot(self, snapshot: dict[str, Any]):
         previous_anchor_id = self._anchor_scan().scan_id if self._anchor_scan() else None
@@ -1139,6 +1311,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._resolve_wall()
         self._render_all()
+
+    def _pan_vertical(self, direction: int):
+        x_range, y_range = self.single.visible_ranges()
+        span = y_range[1] - y_range[0]
+        delta = span * 0.14 * float(direction)
+        new_y = (y_range[0] + delta, y_range[1] + delta)
+
+        self._syncing_ranges = True
+        try:
+            for canvas in [self.single, *self.wall_canvases]:
+                canvas.set_view_ranges(x_range, new_y)
+        finally:
+            self._syncing_ranges = False
+        self.render_timer.start()
+
 
     def _step_elevation(self, direction: int):
         elevations = sorted(self.histories)
