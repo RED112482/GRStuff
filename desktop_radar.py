@@ -727,6 +727,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.anchor_elevation: float | None = None
         self.anchor_index = 0
         self.wall_scans: dict[float, RadarScan | None] = {}
+        self.follow_live = True
 
         self._syncing_ranges = False
         self._wall_mode = False
@@ -886,7 +887,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         history = self._history()
-        if previous_anchor_id:
+        if self.follow_live:
+            self.anchor_index = 0
+        elif previous_anchor_id:
             match = next(
                 (
                     idx
@@ -940,6 +943,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if anchor is None:
             return
 
+        # LIVE mode is mosaic-like: every elevation shows its own newest
+        # available scan, even if that scan is several minutes older than the
+        # currently active elevation. Once the user steps into history, the
+        # highlighted/active scan becomes the common temporal ceiling.
+        if self.follow_live:
+            for elevation, history in self.histories.items():
+                self.wall_scans[elevation] = history[0] if history else None
+            return
+
         anchor_time = anchor.scan_time
         for elevation, history in self.histories.items():
             chosen = next(
@@ -986,8 +998,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         source = (
             "LIVE"
-            if scan.source == "live" and scan.volume_id == self.live_volume
-            else scan.kind
+            if self.follow_live
+            else (
+                scan.kind
+                if scan.kind != "BASE"
+                else "HISTORY"
+            )
         )
         self.time_label.setText(
             f"{scan.scan_time:%H:%M:%SZ} · {source} · {scan.elevation:.2f}°"
@@ -1034,8 +1050,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 0,
             )
             self.anchor_index = found
+            self.follow_live = found == 0
         else:
             self.anchor_index = 0
+            self.follow_live = True
 
         self._refresh_combo()
         self._resolve_wall()
@@ -1054,14 +1072,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         history = self._history()
         if history:
-            self.anchor_index = next(
-                (
-                    idx
-                    for idx, scan in enumerate(history)
-                    if scan.scan_time <= old_time
-                ),
-                len(history) - 1,
-            )
+            if self.follow_live:
+                self.anchor_index = 0
+            else:
+                self.anchor_index = next(
+                    (
+                        idx
+                        for idx, scan in enumerate(history)
+                        if scan.scan_time <= old_time
+                    ),
+                    len(history) - 1,
+                )
         else:
             self.anchor_index = 0
 
@@ -1086,14 +1107,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.anchor_elevation = elevations[target]
         history = self._history()
-        self.anchor_index = next(
-            (
-                idx
-                for idx, scan in enumerate(history)
-                if scan.scan_time <= old_time
-            ),
-            max(0, len(history) - 1),
-        )
+        if self.follow_live:
+            self.anchor_index = 0
+        else:
+            self.anchor_index = next(
+                (
+                    idx
+                    for idx, scan in enumerate(history)
+                    if scan.scan_time <= old_time
+                ),
+                max(0, len(history) - 1),
+            )
         self._refresh_combo()
         self._resolve_wall()
         self._render_all()
@@ -1105,11 +1129,13 @@ class MainWindow(QtWidgets.QMainWindow):
         target = self.anchor_index + direction
         if target < 0 or target >= len(history):
             return
+        self.follow_live = False
         self.anchor_index = target
         self._resolve_wall()
         self._render_all()
 
     def _go_live(self):
+        self.follow_live = True
         self.anchor_index = 0
         self._resolve_wall()
         self._render_all()
