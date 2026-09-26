@@ -294,6 +294,133 @@ def _archive_base_tilts(radar) -> list[dict[str, Any]]:
     return _group_base_tilts(items)
 
 
+def _bool_attr(ds, name: str) -> bool:
+    value = ds.attrs.get(name, False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    try:
+        return bool(value)
+    except Exception:
+        return False
+
+
+def _int_attr(ds, name: str) -> int:
+    value = ds.attrs.get(name, 0)
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _xradar_physical_sequence(tree) -> list[dict[str, Any]]:
+    """Return physical scan cuts in acquisition order, preserving supplemental cuts.
+
+    Consecutive same-angle split cuts are grouped into one physical elevation scan.
+    SAILS/MRLE labels come from native Level-II metadata exposed by Xradar.
+    """
+    raw_items: list[dict[str, Any]] = []
+
+    for group in _live_sweep_groups(tree):
+        try:
+            ds = tree[group].to_dataset(inherit="all_coords")
+            elevation = float(np.asarray(ds["sweep_fixed_angle"].values).reshape(-1)[0])
+        except Exception:
+            continue
+
+        raw_items.append({
+            "group": group,
+            "elevation": elevation,
+            "sails": _bool_attr(ds, "sails_cut"),
+            "sails_sequence": _int_attr(ds, "sails_sequence_number"),
+            "mrle": _bool_attr(ds, "mrle_cut"),
+            "mrle_sequence": _int_attr(ds, "mrle_sequence_number"),
+            "base_tilt_cut": _bool_attr(ds, "base_tilt_cut"),
+            "waveform_type": str(ds.attrs.get("waveform_type", "")),
+        })
+
+    scans: list[dict[str, Any]] = []
+    i = 0
+    while i < len(raw_items):
+        item = raw_items[i]
+        grouped = [item]
+        j = i + 1
+
+        while j < len(raw_items) and _angle_matches(
+            raw_items[j]["elevation"], item["elevation"]
+        ):
+            grouped.append(raw_items[j])
+            j += 1
+
+        sails = any(x["sails"] for x in grouped)
+        mrle = any(x["mrle"] for x in grouped)
+        sails_seq = max((x["sails_sequence"] for x in grouped), default=0)
+        mrle_seq = max((x["mrle_sequence"] for x in grouped), default=0)
+
+        if sails:
+            kind = "SAILS"
+            sequence_number = sails_seq or 1
+        elif mrle:
+            kind = "MRLE"
+            sequence_number = mrle_seq or 1
+        else:
+            kind = "BASE"
+            sequence_number = 0
+
+        scans.append({
+            "sequence_index": len(scans),
+            "elevation": float(item["elevation"]),
+            "kind": kind,
+            "sequence_number": sequence_number,
+            "raw": [x["group"] for x in grouped],
+            "split_cut": len(grouped) > 1,
+            "base_tilt_cut": any(x["base_tilt_cut"] for x in grouped),
+        })
+        i = j
+
+    return scans
+
+
+def _base_tilts_from_sequence(sequence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    logical: list[dict[str, Any]] = []
+    seen: list[float] = []
+
+    for scan in sequence:
+        if scan["kind"] != "BASE":
+            continue
+        elevation = float(scan["elevation"])
+        if any(_angle_matches(elevation, value) for value in seen):
+            continue
+        logical.append({
+            "index": len(logical),
+            "elevation": elevation,
+            "raw": scan["raw"],
+            "sequence_index": scan["sequence_index"],
+            "kind": "BASE",
+        })
+        seen.append(elevation)
+
+    return logical
+
+
+def _xradar_sequence_for_archive(key: str) -> list[dict[str, Any]]:
+    if not XRADAR_AVAILABLE:
+        return []
+
+    local_path = _archive_local_path(key)
+    if not local_path.exists():
+        s3.download_file(BUCKET, key, str(local_path))
+
+    try:
+        tree = xd.io.open_nexradlevel2_datatree(
+            str(local_path),
+            incomplete_sweep="drop",
+        )
+        return _xradar_physical_sequence(tree)
+    except Exception as exc:
+        print(f"[SEQUENCE TEMPLATE ERROR] {type(exc).__name__}: {exc}", flush=True)
+        return []
+
+
 XR_FIELD_MAP = {
     "reflectivity": ("DBZH", "DBZ", "REF"),
     "velocity": ("VRADH", "VRAD", "VEL"),
@@ -322,22 +449,15 @@ def _live_sweep_groups(tree=None) -> list[str]:
     return sorted(groups, key=sort_key)
 
 
-def _live_base_tilts(tree=None) -> list[dict[str, Any]]:
+def _live_scan_sequence(tree=None) -> list[dict[str, Any]]:
     tree = tree if tree is not None else live_tree
-    items: list[tuple[str, float]] = []
-
     if tree is None:
         return []
+    return _xradar_physical_sequence(tree)
 
-    for group in _live_sweep_groups(tree):
-        try:
-            ds = tree[group].to_dataset(inherit="all_coords")
-            elevation = float(np.asarray(ds["sweep_fixed_angle"].values).reshape(-1)[0])
-            items.append((group, elevation))
-        except Exception:
-            continue
 
-    return _group_base_tilts(items)
+def _live_base_tilts(tree=None) -> list[dict[str, Any]]:
+    return _base_tilts_from_sequence(_live_scan_sequence(tree))
 
 
 def _chunk_volume_prefix_and_keys() -> tuple[str | None, list[dict[str, Any]]]:
