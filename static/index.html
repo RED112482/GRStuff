@@ -12,14 +12,21 @@
 <body>
   <header class="topbar">
     <div>
-      <div class="eyebrow">NEXRAD LEVEL-II / RAPID INTERROGATION PROTOTYPE</div>
+      <div class="eyebrow">NEXRAD LEVEL-II / LIVE VOLUME INTERROGATION</div>
       <h1>KMOB Volume Explorer</h1>
     </div>
-    <div class="status-wrap">
-      <span id="statusDot" class="status-dot"></span>
-      <div>
-        <div id="statusText" class="status-text">Connecting…</div>
-        <div id="volumeTime" class="status-sub">Waiting for volume metadata</div>
+
+    <div class="header-status">
+      <div id="liveBadge" class="live-badge">
+        <span id="liveLight" class="live-light"></span>
+        <span id="liveText">CONNECTING</span>
+      </div>
+      <div class="status-wrap">
+        <span id="statusDot" class="status-dot"></span>
+        <div>
+          <div id="statusText" class="status-text">Connecting…</div>
+          <div id="volumeTime" class="status-sub">Waiting for volume metadata</div>
+        </div>
       </div>
     </div>
   </header>
@@ -41,6 +48,17 @@
           <button id="tiltUpBtn" type="button" title="Higher tilt (Up Arrow)">▲</button>
         </div>
 
+        <div class="time-stepper" aria-label="Time controls">
+          <button id="timePastBtn" type="button" title="Older frame (Left Arrow)">◀</button>
+          <div class="time-readout">
+            <span class="toolbar-caption">TIME</span>
+            <strong id="timeLabel">LIVE</strong>
+            <small id="timeStamp">—</small>
+          </div>
+          <button id="timeFutureBtn" type="button" title="Newer frame (Right Arrow)">▶</button>
+          <button id="goLiveBtn" class="go-live" type="button">LIVE</button>
+        </div>
+
         <label>
           Range
           <select id="rangeSelect">
@@ -57,12 +75,15 @@
           <span>2-D Smooth</span>
         </label>
 
-        <button id="refreshBtn" type="button">Refresh now</button>
+        <button id="wallToggleBtn" type="button">16 Panel</button>
+        <button id="refreshBtn" type="button">Refresh</button>
       </div>
 
-      <div class="radar-shell">
-        <div id="radarStage" class="radar-stage" tabindex="0" aria-label="Interactive radar display. Use mouse wheel or up and down arrow keys to change tilts.">
+      <div id="singleView" class="radar-shell">
+        <div id="radarStage" class="radar-stage" tabindex="0" aria-label="Interactive radar display. Use mouse wheel or up and down arrow keys to change tilts. Use left and right arrow keys to change time.">
           <img id="radarImage" alt="KMOB radar sweep">
+
+          <svg id="boundaryOverlay" class="boundary-overlay" aria-hidden="true"></svg>
 
           <div class="tilt-hud">
             <div class="tilt-hud-top">
@@ -73,7 +94,7 @@
             <div id="cursorHud" class="cursor-hud">Wheel ↑ higher tilt · Wheel ↓ lower tilt</div>
           </div>
 
-          <div class="nav-hint">↑ / ↓ or mouse wheel changes tilt</div>
+          <div class="nav-hint">↑/↓ tilt · ←/→ time · wheel tilt</div>
 
           <svg id="overlay" class="overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">
             <g class="rings">
@@ -99,6 +120,17 @@
         </div>
       </div>
 
+      <div id="wallView" class="wall-shell hidden">
+        <div class="wall-head">
+          <div>
+            <div class="eyebrow">UNIQUE BASE ELEVATIONS ONLY</div>
+            <strong>16-Panel Tilt Wall</strong>
+          </div>
+          <div id="wallStatus" class="wall-status">Waiting for live volume…</div>
+        </div>
+        <div id="tiltWall" class="tilt-wall"></div>
+      </div>
+
       <div class="footer-strip">
         <span id="productLabel">—</span>
         <span id="sweepLabel">—</span>
@@ -116,7 +148,7 @@
       </div>
 
       <div id="emptyState" class="empty-state">
-        Click anywhere in the PPI to lock a location. The table samples the nearest gate through every elevation. Click any table row to jump directly to that tilt.
+        Click anywhere in the PPI to lock a location. Supplemental SAILS/MRLE repeats are suppressed; the table contains one base elevation per tilt. Click any row to jump directly to that tilt.
       </div>
 
       <div id="analysisContent" class="hidden">
