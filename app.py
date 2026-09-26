@@ -691,45 +691,86 @@ def api_refresh() -> dict[str, Any]:
     }
 
 
-@app.get("/api/history")
-def api_history() -> dict[str, Any]:
-    frames = [{
-        "frame": 0,
-        "source": "live" if live_tree is not None else "archive",
-        "key": live_token if live_tree is not None else (archive_history[0]["key"] if archive_history else None),
-        "volume_time": (
-            live_volume_time.isoformat()
-            if live_tree is not None and live_volume_time
-            else (
-                archive_history[0]["volume_time"].isoformat()
-                if archive_history and archive_history[0]["volume_time"]
-                else None
-            )
-        ),
-        "label": "LIVE" if live_tree is not None else "LATEST",
-    }]
-
-    for idx, item in enumerate(archive_history[:HISTORY_FRAMES], start=1):
-        frames.append({
-            "frame": idx,
-            "source": "archive",
-            "key": item["key"],
-            "volume_time": item["volume_time"].isoformat() if item["volume_time"] else None,
-            "label": f"-{idx}",
-        })
-
-    return {"frames": frames, "max_frame": max(0, len(frames) - 1)}
-
-
-def _archive_frame(frame: int) -> tuple[Any, dict[str, Any]]:
+def _history_frames_metadata() -> list[dict[str, Any]]:
     if not archive_history:
         refresh_archive_history()
 
-    archive_index = max(0, frame - 1)
-    if frame == 0 and live_tree is None:
-        archive_index = 0
+    with live_lock:
+        has_live = live_tree is not None
+        token = live_token
+        live_time = live_volume_time
 
-    if archive_index >= len(archive_history):
+    frames: list[dict[str, Any]] = []
+
+    if has_live:
+        frames.append({
+            "frame": 0,
+            "source": "live",
+            "key": token,
+            "archive_index": None,
+            "volume_time": live_time.isoformat() if live_time else None,
+            "label": "LIVE",
+        })
+
+        archive_items = list(enumerate(archive_history[:HISTORY_FRAMES]))
+    else:
+        if not archive_history:
+            return []
+        first = archive_history[0]
+        frames.append({
+            "frame": 0,
+            "source": "archive",
+            "key": first["key"],
+            "archive_index": 0,
+            "volume_time": first["volume_time"].isoformat() if first["volume_time"] else None,
+            "label": "LATEST",
+        })
+        archive_items = list(enumerate(archive_history[1:HISTORY_FRAMES], start=1))
+
+    for archive_index, item in archive_items:
+        # Avoid showing the same volume twice when the live chunk volume has
+        # already appeared in the completed-volume archive.
+        if has_live and live_time and item["volume_time"]:
+            if abs((item["volume_time"] - live_time).total_seconds()) < 30:
+                continue
+
+        frame_number = len(frames)
+        frames.append({
+            "frame": frame_number,
+            "source": "archive",
+            "key": item["key"],
+            "archive_index": archive_index,
+            "volume_time": item["volume_time"].isoformat() if item["volume_time"] else None,
+            "label": f"-{frame_number}",
+        })
+
+        if frame_number >= HISTORY_FRAMES:
+            break
+
+    return frames
+
+
+@app.get("/api/history")
+def api_history() -> dict[str, Any]:
+    frames = _history_frames_metadata()
+    return {
+        "frames": frames,
+        "max_frame": max(0, len(frames) - 1),
+        "count": len(frames),
+    }
+
+
+def _archive_frame(frame: int) -> tuple[Any, dict[str, Any]]:
+    frames = _history_frames_metadata()
+    if frame < 0 or frame >= len(frames):
+        raise HTTPException(status_code=404, detail="History frame is not available.")
+
+    meta = frames[frame]
+    if meta["source"] == "live":
+        raise HTTPException(status_code=400, detail="Frame 0 is the live chunk volume.")
+
+    archive_index = meta.get("archive_index")
+    if archive_index is None or archive_index >= len(archive_history):
         raise HTTPException(status_code=404, detail="History frame is not available.")
 
     entry = archive_history[archive_index]
