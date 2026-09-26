@@ -553,12 +553,12 @@ class RadarDataWorker(QtCore.QThread):
             )
             if self.site_lat is None or self.site_lon is None:
                 self.site_lat, self.site_lon = _tree_site_location(tree)
-                self._load_boundaries()
             scans = _extract_scans(tree, key, "archive")
             self._merge_scans(scans)
 
         self.status.emit("Archive ready · connecting live chunks…")
         self._emit_snapshot()
+        self._load_boundaries()
 
     def _load_boundaries(self):
         if self._boundaries_loaded:
