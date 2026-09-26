@@ -5,6 +5,7 @@ channels:
 dependencies:
   - python=3.11
   - arm_pyart=2.3.*
+  - xradar>=0.12,<0.13
   - pip
   - pip:
       - fastapi>=0.116,<1
