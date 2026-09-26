@@ -79,6 +79,15 @@
         <button id="refreshBtn" type="button">Refresh</button>
       </div>
 
+      <div class="scan-sequence-shell">
+        <div class="scan-sequence-title">
+          <span>SCAN ORDER</span>
+          <strong id="scanNowLabel">Waiting for scan metadata…</strong>
+          <span id="scanNextLabel"></span>
+        </div>
+        <div id="scanSequence" class="scan-sequence"></div>
+      </div>
+
       <div id="singleView" class="radar-shell">
         <div id="radarStage" class="radar-stage" tabindex="0" aria-label="Interactive radar display. Use mouse wheel or up and down arrow keys to change tilts. Use left and right arrow keys to change time.">
           <img id="radarImage" alt="KMOB radar sweep">
@@ -123,7 +132,7 @@
       <div id="wallView" class="wall-shell hidden">
         <div class="wall-head">
           <div>
-            <div class="eyebrow">UNIQUE BASE ELEVATIONS ONLY</div>
+            <div class="eyebrow">BASE ELEVATION PANELS · SUPPLEMENTALS LABELED</div>
             <strong>16-Panel Tilt Wall</strong>
           </div>
           <div id="wallStatus" class="wall-status">Waiting for live volume…</div>
@@ -148,7 +157,7 @@
       </div>
 
       <div id="emptyState" class="empty-state">
-        Click anywhere in the PPI to lock a location. Supplemental SAILS/MRLE repeats are suppressed; the table contains one base elevation per tilt. Click any row to jump directly to that tilt.
+        Click anywhere in the PPI to lock a location. Base elevations appear once in the table; SAILS/MRLE supplemental cuts are tracked separately in the live scan-order strip above. Click any row to jump directly to that base elevation.
       </div>
 
       <div id="analysisContent" class="hidden">
