@@ -4,8 +4,12 @@ import asyncio
 import io
 import math
 import os
+import re
 import tempfile
 import threading
+import urllib.request
+import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,13 +26,31 @@ from fastapi.staticfiles import StaticFiles
 from matplotlib import colormaps
 from PIL import Image
 
+try:
+    import xradar as xd
+    XRADAR_AVAILABLE = tuple(int(p) for p in xd.__version__.split(".")[:2]) >= (0, 12)
+except Exception:
+    xd = None
+    XRADAR_AVAILABLE = False
+
+try:
+    from cartopy.io import shapereader
+    CARTOPY_AVAILABLE = True
+except Exception:
+    shapereader = None
+    CARTOPY_AVAILABLE = False
+
 RADAR_ID = os.getenv("RADAR_ID", "KMOB").upper()
 BUCKET = os.getenv("NEXRAD_BUCKET", "unidata-nexrad-level2")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
+CHUNK_BUCKET = os.getenv("NEXRAD_CHUNK_BUCKET", "unidata-nexrad-level2-chunks")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "2"))
+HISTORY_FRAMES = int(os.getenv("HISTORY_FRAMES", "10"))
 DEFAULT_RANGE_KM = float(os.getenv("DEFAULT_RANGE_KM", "150"))
 RASTER_SIZE = int(os.getenv("RADAR_RASTER_SIZE", "640"))
 CACHE_DIR = Path(os.getenv("RADAR_CACHE_DIR", Path(tempfile.gettempdir()) / "kmob-level2"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+BOUNDARY_DIR = CACHE_DIR / "boundaries"
+BOUNDARY_DIR.mkdir(parents=True, exist_ok=True)
 
 FIELD_CONFIG = {
     "reflectivity": {"label": "Reflectivity", "units": "dBZ", "vmin": -10, "vmax": 75, "cmap": "turbo"},
@@ -54,8 +76,26 @@ state = VolumeState()
 state_lock = threading.RLock()
 image_cache: dict[tuple[Any, ...], bytes] = {}
 image_cache_lock = threading.RLock()
+archive_history: list[dict[str, Any]] = []
+archive_radar_cache: OrderedDict[str, Any] = OrderedDict()
+archive_lock = threading.RLock()
+
+live_lock = threading.RLock()
+live_prefix: str | None = None
+live_chunk_bytes: dict[str, bytes] = {}
+live_tree: Any | None = None
+live_token: str | None = None
+live_volume_time: datetime | None = None
+live_updated_at: datetime | None = None
+live_complete = False
+live_error: str | None = None
+
+boundary_cache: dict[str, Any] = {}
+boundary_lock = threading.RLock()
+
 s3 = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
-app = FastAPI(title="KMOB Level-II Volume Explorer", version="0.2.0")
+s3_chunks = boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
+app = FastAPI(title="KMOB Level-II Volume Explorer", version="0.3.0")
 
 
 def _candidate_prefixes(now: datetime) -> list[str]:
