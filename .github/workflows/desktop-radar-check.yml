@@ -1,0 +1,24 @@
+name: Desktop radar prototype check
+
+on:
+  push:
+    branches: [desktop-radar-prototype]
+  pull_request:
+    paths:
+      - "desktop_radar.py"
+      - "desktop_requirements.txt"
+      - "desktop_environment.yml"
+      - "DESKTOP_README.md"
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile desktop Python
+        run: python -m py_compile desktop_radar.py
+      - name: Verify desktop entry points
+        run: python -c "import ast, pathlib; tree=ast.parse(pathlib.Path('desktop_radar.py').read_text()); names={n.name for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef))}; required={'RadarDataWorker','RadarCanvas','MainWindow','render_scan','main'}; missing=required-names; assert not missing, missing"
