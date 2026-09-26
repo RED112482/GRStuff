@@ -1001,18 +1001,65 @@ def _expected_base_elevations() -> list[float]:
     return values[:16]
 
 
+def _default_anchor_ref() -> dict[str, Any] | None:
+    with live_lock:
+        tree = live_tree
+        current_live_time = live_volume_time
+
+    if tree is not None:
+        sequence = _live_scan_sequence(tree)
+        if sequence:
+            scan = sequence[-1]
+            return _scan_ref(
+                "live",
+                int(scan["sequence_index"]),
+                scan,
+                volume_offset=0,
+                volume_time=current_live_time,
+            )
+
+    if archive_history:
+        entry = archive_history[0]
+        sequence = _archive_sequence_for_key(entry["key"])
+        if sequence:
+            scan = sequence[-1]
+            return _scan_ref(
+                "archive",
+                int(scan["sequence_index"]),
+                scan,
+                archive_key=entry["key"],
+                volume_offset=1,
+                volume_time=entry["volume_time"],
+            )
+
+    return None
+
+
 @app.get("/api/elevations")
 def api_elevations() -> dict[str, Any]:
     elevations = _expected_base_elevations()
+    anchor = _default_anchor_ref()
     slots = []
 
-    for index, elevation in enumerate(elevations):
-        history = _scan_history_for_elevation(elevation, limit=1)
-        slots.append({
+    if anchor is not None:
+        for index, elevation in enumerate(elevations):
+            scan = _wall_scan_for_elevation(
+                elevation,
+                anchor["source"],
+                int(anchor["sequence_index"]),
+                anchor.get("archive_key"),
+            )
+            slots.append({
+                "index": index,
+                "elevation": round(elevation, 2),
+                "latest": scan,
+            })
+    else:
+        slots = [{
             "index": index,
             "elevation": round(elevation, 2),
-            "latest": history[0] if history else None,
-        })
+            "latest": None,
+        } for index, elevation in enumerate(elevations)]
 
     with live_lock:
         tree = live_tree
@@ -1024,6 +1071,7 @@ def api_elevations() -> dict[str, Any]:
 
     return {
         "slots": slots,
+        "anchor": anchor,
         "scan_sequence": [
             _public_scan(scan, _live_tilt_completion(scan))
             for scan in scan_sequence
@@ -1031,141 +1079,6 @@ def api_elevations() -> dict[str, Any]:
         "scan_status": _sequence_status(scan_sequence, template_sequence),
         "live": tree is not None,
     }
-
-
-def _archive_index_for_key(key: str) -> int | None:
-    for index, entry in enumerate(archive_history):
-        if entry["key"] == key:
-            return index
-    return None
-
-
-def _latest_matching_scan(
-    sequence: list[dict[str, Any]],
-    elevation: float,
-    max_sequence_index: int | None = None,
-) -> dict[str, Any] | None:
-    for scan in reversed(sequence):
-        if max_sequence_index is not None and int(scan["sequence_index"]) > max_sequence_index:
-            continue
-        if _angle_matches(scan["elevation"], elevation):
-            return scan
-    return None
-
-
-def _wall_scan_for_elevation(
-    elevation: float,
-    anchor_source: str,
-    anchor_sequence_index: int,
-    anchor_archive_key: str | None,
-) -> dict[str, Any] | None:
-    if anchor_source == "live":
-        with live_lock:
-            tree = live_tree
-            current_live_time = live_volume_time
-
-        if tree is not None:
-            live_sequence = _live_scan_sequence(tree)
-            scan = _latest_matching_scan(
-                live_sequence,
-                elevation,
-                max_sequence_index=anchor_sequence_index,
-            )
-            if scan is not None:
-                return _scan_ref(
-                    "live",
-                    int(scan["sequence_index"]),
-                    scan,
-                    volume_offset=0,
-                    volume_time=current_live_time,
-                )
-
-        # This tilt has not happened yet in the live volume. Keep showing the
-        # latest scan from the most recent completed volume.
-        for archive_index, entry in enumerate(archive_history[:2]):
-            if current_live_time and entry["volume_time"]:
-                if abs((entry["volume_time"] - current_live_time).total_seconds()) < 30:
-                    continue
-            sequence = _archive_sequence_for_key(entry["key"])
-            scan = _latest_matching_scan(sequence, elevation)
-            if scan is not None:
-                return _scan_ref(
-                    "archive",
-                    int(scan["sequence_index"]),
-                    scan,
-                    archive_key=entry["key"],
-                    volume_offset=archive_index + 1,
-                    volume_time=entry["volume_time"],
-                )
-        return None
-
-    if not anchor_archive_key:
-        return None
-
-    anchor_index = _archive_index_for_key(anchor_archive_key)
-    if anchor_index is None:
-        return None
-
-    anchor_entry = archive_history[anchor_index]
-    sequence = _archive_sequence_for_key(anchor_archive_key)
-    scan = _latest_matching_scan(
-        sequence,
-        elevation,
-        max_sequence_index=anchor_sequence_index,
-    )
-    if scan is not None:
-        return _scan_ref(
-            "archive",
-            int(scan["sequence_index"]),
-            scan,
-            archive_key=anchor_archive_key,
-            volume_offset=anchor_index + 1,
-            volume_time=anchor_entry["volume_time"],
-        )
-
-    # The anchor volume had not reached this elevation yet. Fall back exactly
-    # one volume, which is the latest scan that existed at the anchor time.
-    older_index = anchor_index + 1
-    if older_index < len(archive_history):
-        older_entry = archive_history[older_index]
-        older_sequence = _archive_sequence_for_key(older_entry["key"])
-        older_scan = _latest_matching_scan(older_sequence, elevation)
-        if older_scan is not None:
-            return _scan_ref(
-                "archive",
-                int(older_scan["sequence_index"]),
-                older_scan,
-                archive_key=older_entry["key"],
-                volume_offset=older_index + 1,
-                volume_time=older_entry["volume_time"],
-            )
-
-    return None
-
-
-@app.get("/api/wall-state")
-def api_wall_state(
-    anchor_source: str = Query(..., pattern="^(live|archive)$"),
-    anchor_sequence_index: int = Query(..., ge=0),
-    anchor_archive_key: str | None = Query(None),
-) -> dict[str, Any]:
-    elevations = _expected_base_elevations()
-    slots = []
-
-    for index, elevation in enumerate(elevations[:16]):
-        scan = _wall_scan_for_elevation(
-            elevation,
-            anchor_source,
-            anchor_sequence_index,
-            anchor_archive_key,
-        )
-        slots.append({
-            "index": index,
-            "elevation": round(elevation, 2),
-            "scan": scan,
-        })
-
-    return {"slots": slots}
 
 
 @app.get("/api/scan-history")
