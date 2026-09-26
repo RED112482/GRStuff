@@ -21,3 +21,5 @@ jobs:
         run: python -m py_compile app.py
       - name: Check browser JavaScript
         run: node --check static/app.js
+      - name: Verify runtime helpers
+        run: python -c "import app; assert callable(app._wall_scan_for_elevation); assert callable(app.api_wall_state); print('runtime helpers OK')"
