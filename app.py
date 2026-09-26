@@ -76,6 +76,8 @@ state = VolumeState()
 state_lock = threading.RLock()
 image_cache: dict[tuple[Any, ...], bytes] = {}
 image_cache_lock = threading.RLock()
+render_grid_cache: dict[tuple[float, int], tuple[np.ndarray, np.ndarray]] = {}
+render_grid_lock = threading.RLock()
 archive_history: list[dict[str, Any]] = []
 archive_radar_cache: OrderedDict[str, Any] = OrderedDict()
 archive_sequence_cache: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
@@ -223,7 +225,7 @@ def _load_archive_radar(key: str):
     with archive_lock:
         archive_radar_cache[key] = radar
         archive_radar_cache.move_to_end(key)
-        while len(archive_radar_cache) > 3:
+        while len(archive_radar_cache) > 6:
             archive_radar_cache.popitem(last=False)
     return radar
 
@@ -660,13 +662,29 @@ async def poll_loop() -> None:
         await asyncio.sleep(POLL_SECONDS)
 
 
+async def warm_history_loop() -> None:
+    """Warm recent scan metadata and a few archive radars without blocking UI startup."""
+    await asyncio.sleep(0.2)
+    for index, entry in enumerate(list(archive_history[:HISTORY_FRAMES])):
+        try:
+            await asyncio.to_thread(_archive_sequence_for_key, entry["key"])
+            if index < 3:
+                await asyncio.to_thread(_load_archive_radar, entry["key"])
+        except Exception as exc:
+            print(
+                f"[HISTORY WARM ERROR] {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        await asyncio.sleep(0.15)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     # Bring up the application from the completed-volume archive first.
-    # Live chunk discovery runs in the background and must never block Uvicorn
-    # startup or prevent the user interface from loading.
+    # Live chunk discovery and history warming run in the background.
     await asyncio.to_thread(refresh_archive_history)
     asyncio.create_task(poll_loop())
+    asyncio.create_task(warm_history_loop())
 
 
 def get_radar():
@@ -1013,6 +1031,141 @@ def api_elevations() -> dict[str, Any]:
         "scan_status": _sequence_status(scan_sequence, template_sequence),
         "live": tree is not None,
     }
+
+
+def _archive_index_for_key(key: str) -> int | None:
+    for index, entry in enumerate(archive_history):
+        if entry["key"] == key:
+            return index
+    return None
+
+
+def _latest_matching_scan(
+    sequence: list[dict[str, Any]],
+    elevation: float,
+    max_sequence_index: int | None = None,
+) -> dict[str, Any] | None:
+    for scan in reversed(sequence):
+        if max_sequence_index is not None and int(scan["sequence_index"]) > max_sequence_index:
+            continue
+        if _angle_matches(scan["elevation"], elevation):
+            return scan
+    return None
+
+
+def _wall_scan_for_elevation(
+    elevation: float,
+    anchor_source: str,
+    anchor_sequence_index: int,
+    anchor_archive_key: str | None,
+) -> dict[str, Any] | None:
+    if anchor_source == "live":
+        with live_lock:
+            tree = live_tree
+            current_live_time = live_volume_time
+
+        if tree is not None:
+            live_sequence = _live_scan_sequence(tree)
+            scan = _latest_matching_scan(
+                live_sequence,
+                elevation,
+                max_sequence_index=anchor_sequence_index,
+            )
+            if scan is not None:
+                return _scan_ref(
+                    "live",
+                    int(scan["sequence_index"]),
+                    scan,
+                    volume_offset=0,
+                    volume_time=current_live_time,
+                )
+
+        # This tilt has not happened yet in the live volume. Keep showing the
+        # latest scan from the most recent completed volume.
+        for archive_index, entry in enumerate(archive_history[:2]):
+            if current_live_time and entry["volume_time"]:
+                if abs((entry["volume_time"] - current_live_time).total_seconds()) < 30:
+                    continue
+            sequence = _archive_sequence_for_key(entry["key"])
+            scan = _latest_matching_scan(sequence, elevation)
+            if scan is not None:
+                return _scan_ref(
+                    "archive",
+                    int(scan["sequence_index"]),
+                    scan,
+                    archive_key=entry["key"],
+                    volume_offset=archive_index + 1,
+                    volume_time=entry["volume_time"],
+                )
+        return None
+
+    if not anchor_archive_key:
+        return None
+
+    anchor_index = _archive_index_for_key(anchor_archive_key)
+    if anchor_index is None:
+        return None
+
+    anchor_entry = archive_history[anchor_index]
+    sequence = _archive_sequence_for_key(anchor_archive_key)
+    scan = _latest_matching_scan(
+        sequence,
+        elevation,
+        max_sequence_index=anchor_sequence_index,
+    )
+    if scan is not None:
+        return _scan_ref(
+            "archive",
+            int(scan["sequence_index"]),
+            scan,
+            archive_key=anchor_archive_key,
+            volume_offset=anchor_index + 1,
+            volume_time=anchor_entry["volume_time"],
+        )
+
+    # The anchor volume had not reached this elevation yet. Fall back exactly
+    # one volume, which is the latest scan that existed at the anchor time.
+    older_index = anchor_index + 1
+    if older_index < len(archive_history):
+        older_entry = archive_history[older_index]
+        older_sequence = _archive_sequence_for_key(older_entry["key"])
+        older_scan = _latest_matching_scan(older_sequence, elevation)
+        if older_scan is not None:
+            return _scan_ref(
+                "archive",
+                int(older_scan["sequence_index"]),
+                older_scan,
+                archive_key=older_entry["key"],
+                volume_offset=older_index + 1,
+                volume_time=older_entry["volume_time"],
+            )
+
+    return None
+
+
+@app.get("/api/wall-state")
+def api_wall_state(
+    anchor_source: str = Query(..., pattern="^(live|archive)$"),
+    anchor_sequence_index: int = Query(..., ge=0),
+    anchor_archive_key: str | None = Query(None),
+) -> dict[str, Any]:
+    elevations = _expected_base_elevations()
+    slots = []
+
+    for index, elevation in enumerate(elevations[:16]):
+        scan = _wall_scan_for_elevation(
+            elevation,
+            anchor_source,
+            anchor_sequence_index,
+            anchor_archive_key,
+        )
+        slots.append({
+            "index": index,
+            "elevation": round(elevation, 2),
+            "scan": scan,
+        })
+
+    return {"slots": slots}
 
 
 @app.get("/api/scan-history")
@@ -1538,10 +1691,21 @@ def _render_array_png(
     az_sorted = azimuths[order]
     data_sorted = data[order]
 
-    axis = np.linspace(-range_km, range_km, size, dtype=np.float32)
-    xx, yy = np.meshgrid(axis, axis[::-1])
-    rr = np.hypot(xx, yy)
-    az = (np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0
+    grid_key = (round(float(range_km), 2), int(size))
+    with render_grid_lock:
+        grid = render_grid_cache.get(grid_key)
+
+    if grid is None:
+        axis = np.linspace(-range_km, range_km, size, dtype=np.float32)
+        xx, yy = np.meshgrid(axis, axis[::-1])
+        rr = np.hypot(xx, yy).astype(np.float32)
+        az = ((np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0).astype(np.float32)
+        with render_grid_lock:
+            if len(render_grid_cache) >= 12:
+                render_grid_cache.pop(next(iter(render_grid_cache)))
+            render_grid_cache[grid_key] = (rr, az)
+    else:
+        rr, az = grid
 
     gate_hi = np.searchsorted(ranges_km, rr, side="right")
     gate_hi = np.clip(gate_hi, 1, len(ranges_km) - 1)
