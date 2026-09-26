@@ -232,6 +232,46 @@ def reflectivity_lut() -> np.ndarray:
 
 REF_LUT = reflectivity_lut()
 
+_RENDER_GRID_CACHE: OrderedDict[
+    tuple[float, float, float, float, int, int],
+    tuple[np.ndarray, np.ndarray],
+] = OrderedDict()
+_SCAN_SORT_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _render_grid(
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    key = (
+        round(float(x_range[0]), 3),
+        round(float(x_range[1]), 3),
+        round(float(y_range[0]), 3),
+        round(float(y_range[1]), 3),
+        int(width),
+        int(height),
+    )
+    cached = _RENDER_GRID_CACHE.get(key)
+    if cached is not None:
+        _RENDER_GRID_CACHE.move_to_end(key)
+        return cached
+
+    xs = np.linspace(x_range[0], x_range[1], width, dtype=np.float32)
+    ys = np.linspace(y_range[0], y_range[1], height, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    rr = np.hypot(xx, yy).astype(np.float32)
+    az = ((np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0).astype(
+        np.float32
+    )
+
+    _RENDER_GRID_CACHE[key] = (rr, az)
+    _RENDER_GRID_CACHE.move_to_end(key)
+    while len(_RENDER_GRID_CACHE) > 12:
+        _RENDER_GRID_CACHE.popitem(last=False)
+    return rr, az
+
 
 def render_scan(
     scan: RadarScan,
@@ -246,12 +286,12 @@ def render_scan(
     xmin, xmax = x_range
     ymin, ymax = y_range
 
-    xs = np.linspace(xmin, xmax, width, dtype=np.float32)
-    ys = np.linspace(ymin, ymax, height, dtype=np.float32)
-    xx, yy = np.meshgrid(xs, ys)
-
-    rr = np.hypot(xx, yy)
-    az = (np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0
+    rr, az = _render_grid(
+        (xmin, xmax),
+        (ymin, ymax),
+        width,
+        height,
+    )
 
     ranges = scan.range_km
     if ranges.size < 2:
@@ -264,8 +304,13 @@ def render_scan(
     choose_lower = np.abs(rr - ranges[lower_gate]) < np.abs(rr - ranges[gate])
     gate = np.where(choose_lower, lower_gate, gate)
 
-    order = np.argsort(scan.azimuth)
-    az_sorted = scan.azimuth[order]
+    cached_sort = _SCAN_SORT_CACHE.get(scan.scan_id)
+    if cached_sort is None:
+        order = np.argsort(scan.azimuth)
+        az_sorted = np.ascontiguousarray(scan.azimuth[order])
+        _SCAN_SORT_CACHE[scan.scan_id] = (order, az_sorted)
+    else:
+        order, az_sorted = cached_sort
     data_sorted = scan.reflectivity[order]
 
     az_ext = np.concatenate(
