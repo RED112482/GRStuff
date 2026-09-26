@@ -1013,6 +1013,7 @@ class RadarCanvas(QtWidgets.QWidget):
 
         signature = (
             self.scan.scan_id,
+            round(float(self.scan.completion), 1),
             round(float(x_range[0]), 3),
             round(float(x_range[1]), 3),
             round(float(y_range[0]), 3),
