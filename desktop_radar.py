@@ -666,22 +666,66 @@ class RadarDataWorker(QtCore.QThread):
             name = parts[-1]
             if name.startswith(f"{RADAR_ID}_") and name.endswith(".bz2"):
                 names.append(name)
+
+        # Filename contains YYYYMMDD_HHMMSS, so lexical order is chronological
+        # regardless of how dir.list happens to be ordered by the server.
+        names = sorted(set(names))
         return names[-ARCHIVE_VOLUMES:]
+
+    def _tgftp_content_length(self, name: str) -> int | None:
+        url = f"{TGFTP_BASE}/{RADAR_ID}/{name}"
+        request = urllib.request.Request(url, method="HEAD")
+        try:
+            with urllib.request.urlopen(request, timeout=6) as response:
+                value = response.headers.get("Content-Length")
+                return int(value) if value else None
+        except Exception:
+            return None
 
     def _download_tgftp_file(self, name: str) -> Path:
         path = CACHE_DIR / name
+        expected_size = self._tgftp_content_length(name)
+
         if path.exists() and path.stat().st_size > 0:
-            return path
+            local_size = path.stat().st_size
+            if expected_size is None or local_size == expected_size:
+                return path
+            # Cached file was captured while the upstream file was still
+            # growing, or otherwise does not match the current server object.
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
         url = f"{TGFTP_BASE}/{RADAR_ID}/{name}"
         tmp = path.with_suffix(path.suffix + ".part")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
         with urllib.request.urlopen(url, timeout=20) as response:
+            response_size = response.headers.get("Content-Length")
+            response_size = int(response_size) if response_size else expected_size
             with open(tmp, "wb") as handle:
                 while True:
                     block = response.read(1024 * 1024)
                     if not block:
                         break
                     handle.write(block)
+
+        actual_size = tmp.stat().st_size
+        if response_size is not None and actual_size != response_size:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise IOError(
+                f"Incomplete NWS Level-II download for {name}: "
+                f"{actual_size} of {response_size} bytes"
+            )
+
         tmp.replace(path)
         return path
 
@@ -692,29 +736,52 @@ class RadarDataWorker(QtCore.QThread):
     def _bootstrap_archive(self):
         loaded_any = False
 
-        # Prefer the NWS direct Level-II directory for recent completed-volume
-        # history.  Its dir.list is tiny and avoids scanning an entire S3 day.
+        # Prefer the NWS direct directory for recent completed-volume history.
+        # For visualization, pad an incomplete final sweep rather than dropping
+        # the entire file's only available sweep.
         try:
             names = self._recent_tgftp_files()
-            if names:
-                for idx, name in enumerate(names):
-                    if not self._running:
-                        return
-                    self.status.emit(
-                        f"Loading NWS Level-II history {idx + 1}/{len(names)}…"
-                    )
-                    path = self._download_tgftp_file(name)
+            for idx, name in enumerate(names):
+                if not self._running:
+                    return
+
+                self.status.emit(
+                    f"Loading NWS Level-II history {idx + 1}/{len(names)}…"
+                )
+                path = self._download_tgftp_file(name)
+
+                try:
                     tree = xd.io.open_nexradlevel2_datatree(
                         str(path),
-                        incomplete_sweep="drop",
+                        incomplete_sweep="pad",
                     )
-                    if self.site_lat is None or self.site_lon is None:
+                except Exception as exc:
+                    print(
+                        f"[NWS HISTORY SKIP] {name}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    continue
+
+                scans = _extract_scans(tree, name, "archive")
+                if not scans:
+                    print(
+                        f"[NWS HISTORY SKIP] {name}: no usable sweeps",
+                        flush=True,
+                    )
+                    continue
+
+                if self.site_lat is None or self.site_lon is None:
+                    try:
                         self.site_lat, self.site_lon = _tree_site_location(tree)
-                    scans = _extract_scans(tree, name, "archive")
-                    self._merge_scans(scans)
-                    self.expected_sequence = list(scans)
-                    self.strategy = _scan_strategy(tree)
-                    loaded_any = loaded_any or bool(scans)
+                    except Exception:
+                        pass
+
+                self._merge_scans(scans)
+                self.expected_sequence = list(scans)
+                self.strategy = _scan_strategy(tree)
+                loaded_any = True
+
         except Exception as exc:
             self.status.emit(
                 f"NWS direct history unavailable · using AWS archive "
@@ -723,38 +790,63 @@ class RadarDataWorker(QtCore.QThread):
 
         if not loaded_any:
             keys = self._recent_archive_keys()
-            if not keys:
-                self.status.emit("No recent completed KMOB volume found.")
-                return
+            if keys:
+                for idx, key in enumerate(reversed(keys)):
+                    if not self._running:
+                        return
 
-            for idx, key in enumerate(reversed(keys)):
-                if not self._running:
-                    return
-                path = self._archive_path(key)
-                if not path.exists():
-                    self.status.emit(
-                        f"Downloading AWS archive volume {idx + 1}/{len(keys)}…"
-                    )
-                    self.archive_s3.download_file(
-                        ARCHIVE_BUCKET,
-                        key,
-                        str(path),
-                    )
+                    path = self._archive_path(key)
+                    if not path.exists():
+                        self.status.emit(
+                            f"Downloading AWS archive volume "
+                            f"{idx + 1}/{len(keys)}…"
+                        )
+                        self.archive_s3.download_file(
+                            ARCHIVE_BUCKET,
+                            key,
+                            str(path),
+                        )
 
-                tree = xd.io.open_nexradlevel2_datatree(
-                    str(path),
-                    incomplete_sweep="drop",
-                )
-                if self.site_lat is None or self.site_lon is None:
-                    self.site_lat, self.site_lon = _tree_site_location(tree)
-                scans = _extract_scans(tree, key, "archive")
-                self._merge_scans(scans)
-                self.expected_sequence = list(scans)
-                self.strategy = _scan_strategy(tree)
+                    try:
+                        tree = xd.io.open_nexradlevel2_datatree(
+                            str(path),
+                            incomplete_sweep="pad",
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[AWS HISTORY SKIP] {key}: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                        continue
 
-        self.status.emit("History ready · connecting live chunks…")
-        self._emit_snapshot()
-        self._load_boundaries()
+                    scans = _extract_scans(tree, key, "archive")
+                    if not scans:
+                        continue
+
+                    if self.site_lat is None or self.site_lon is None:
+                        try:
+                            self.site_lat, self.site_lon = _tree_site_location(tree)
+                        except Exception:
+                            pass
+
+                    self._merge_scans(scans)
+                    self.expected_sequence = list(scans)
+                    self.strategy = _scan_strategy(tree)
+                    loaded_any = True
+
+        if loaded_any:
+            total_scans = sum(len(items) for items in self.histories.values())
+            self.status.emit(
+                f"History ready · {total_scans} scans · connecting live chunks…"
+            )
+            self._emit_snapshot()
+            self._load_boundaries()
+        else:
+            self.status.emit(
+                "No decoded history yet · waiting for live chunks…"
+            )
+            self._emit_snapshot()
 
 
     def _load_boundaries(self):
