@@ -355,11 +355,12 @@ async function loadElevations({preserveAnchor = true} = {}) {
 async function loadStatus() {
   try {
     const data = await json("/api/status");
+    const alreadyInitialized = state.lastStatus !== null;
     const tokenChanged = data.live_token !== state.lastLiveToken;
     state.lastLiveToken = data.live_token;
     updateStatus(data);
 
-    if (tokenChanged && state.followLatest) {
+    if (alreadyInitialized && tokenChanged && state.followLatest) {
       await loadElevations({preserveAnchor: false});
     }
   } catch (err) {
