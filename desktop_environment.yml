@@ -1,0 +1,12 @@
+name: kmob-radar-desktop
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - xradar=0.12.*
+  - numpy>=2,<3
+  - boto3>=1.40,<2
+  - pyside6>=6.11,<6.12
+  - pyqtgraph=0.14.*
+  - numba
