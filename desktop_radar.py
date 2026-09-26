@@ -1303,8 +1303,8 @@ class RadarCanvas(QtWidgets.QWidget):
         x_range, y_range = self.visible_ranges()
         size = self.plot.viewport().size()
         if self.compact:
-            width = max(128, min(size.width(), 190))
-            height = max(128, min(size.height(), 190))
+            width = max(120, min(size.width(), 160))
+            height = max(120, min(size.height(), 160))
         else:
             width = max(350, min(size.width(), 1000))
             height = max(350, min(size.height(), 1000))
@@ -1320,6 +1320,9 @@ class RadarCanvas(QtWidgets.QWidget):
             int(height),
         )
         return signature, x_range, y_range, width, height
+
+    def cancel_pending_render(self):
+        self._pending_render_signature = None
 
     def request_rerender(
         self,
@@ -1797,12 +1800,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.future_btn.setEnabled(self.anchor_index > 0)
 
     def _rerender_visible(self):
-        # Keep the primary pane responsive by giving it higher queue priority.
-        self.single.request_rerender(self.render_pool, priority=10)
-        if self._wall_mode:
-            for canvas in self.wall_canvases:
-                if canvas.scan is not None:
-                    canvas.request_rerender(self.render_pool, priority=0)
+        # A fast interaction can create several obsolete queued viewports.
+        # Drop queued (not-yet-running) work and schedule only the newest view.
+        self.render_pool.clear()
+        for canvas in [self.single, *self.wall_canvases]:
+            canvas.cancel_pending_render()
+
+        if not self._wall_mode:
+            self.single.request_rerender(self.render_pool, priority=10)
+            return
+
+        for canvas in self.wall_canvases:
+            if canvas.scan is None:
+                continue
+            elevation = canvas.property("elevation")
+            active = (
+                elevation is not None
+                and self.anchor_elevation is not None
+                and abs(float(elevation) - self.anchor_elevation) <= 0.07
+            )
+            canvas.request_rerender(
+                self.render_pool,
+                priority=10 if active else 0,
+            )
 
     def _view_changed(self, source: RadarCanvas):
         if self._syncing_ranges or not hasattr(self, "render_timer"):
