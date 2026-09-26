@@ -583,6 +583,7 @@ class RadarDataWorker(QtCore.QThread):
         self.site_lon: float | None = None
         self._boundaries_loaded = False
         self._chunk_bytes: dict[str, bytes] = {}
+        self._last_live_discovery_log = 0.0
 
         self.archive_s3 = boto3.client(
             "s3",
@@ -1001,11 +1002,14 @@ class RadarDataWorker(QtCore.QThread):
                 break
 
         if not all_candidates:
-            print(
-                "[LIVE DISCOVERY] no S-start volume in prefixes: "
-                + ", ".join(prefixes[:13]),
-                flush=True,
-            )
+            now_mono = time.monotonic()
+            if now_mono - self._last_live_discovery_log >= 30.0:
+                print(
+                    "[LIVE DISCOVERY] no S-start volume in prefixes: "
+                    + ", ".join(prefixes[:13]),
+                    flush=True,
+                )
+                self._last_live_discovery_log = now_mono
             self.status.emit(
                 "LIVE · waiting for next volume-start S chunk · showing completed data"
             )
@@ -1210,6 +1214,7 @@ class RadarCanvas(QtWidgets.QWidget):
         self._rerendering = False
         self._last_render_signature: tuple[Any, ...] | None = None
         self._pending_render_signature: tuple[Any, ...] | None = None
+        self._render_debug_printed = False
 
         self.view_box = RadarViewBox()
         self.plot = pg.PlotWidget(viewBox=self.view_box)
@@ -1304,10 +1309,19 @@ class RadarCanvas(QtWidgets.QWidget):
         stack.addWidget(self.plot)
 
         self.overlay_widget = QtWidgets.QWidget()
+        self.overlay_widget.setObjectName("radarOverlay")
         self.overlay_widget.setLayout(overlay)
+        self.overlay_widget.setAutoFillBackground(False)
         self.overlay_widget.setAttribute(
             QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents,
             True,
+        )
+        self.overlay_widget.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
+            True,
+        )
+        self.overlay_widget.setStyleSheet(
+            "#radarOverlay { background: transparent; border: none; }"
         )
         stack.addWidget(self.overlay_widget)
         # In StackAll mode the current widget is raised above the others.
@@ -1525,6 +1539,15 @@ class RadarCanvas(QtWidgets.QWidget):
         self.image.setRect(QtCore.QRectF(*rect))
         self._last_render_signature = signature
         self._pending_render_signature = None
+        if not self._render_debug_printed:
+            finite_count = int(np.count_nonzero(np.isfinite(image)))
+            print(
+                f"[RENDER] {self.scan.label if self.scan else 'unknown'} · "
+                f"{image.shape[1]}x{image.shape[0]} · "
+                f"{finite_count} finite pixels",
+                flush=True,
+            )
+            self._render_debug_printed = True
 
     @QtCore.Slot(object, str)
     def _render_failed(self, signature, message: str):
