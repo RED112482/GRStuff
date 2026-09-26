@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KMOB Level-II Volume Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">NEXRAD LEVEL-II / LIVE VOLUME INTERROGATION</div>
+      <h1>KMOB Volume Explorer</h1>
+    </div>
+
+    <div class="header-status">
+      <div id="liveBadge" class="live-badge">
+        <span id="liveLight" class="live-light"></span>
+        <span id="liveText">CONNECTING</span>
+      </div>
+      <div class="status-wrap">
+        <span id="statusDot" class="status-dot"></span>
+        <div>
+          <div id="statusText" class="status-text">Connecting…</div>
+          <div id="volumeTime" class="status-sub">Waiting for volume metadata</div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="viewer-panel">
+      <div class="toolbar">
+        <label>
+          Product
+          <select id="fieldSelect"></select>
+        </label>
+
+        <div class="tilt-stepper" aria-label="Tilt controls">
+          <button id="tiltDownBtn" type="button" title="Lower tilt (Down Arrow)">▼</button>
+          <label>
+            Elevation
+            <select id="sweepSelect"></select>
+          </label>
+          <button id="tiltUpBtn" type="button" title="Higher tilt (Up Arrow)">▲</button>
+        </div>
+
+        <div class="time-stepper" aria-label="Time controls">
+          <button id="timePastBtn" type="button" title="Older frame (Left Arrow)">◀</button>
+          <div class="time-readout">
+            <span class="toolbar-caption">TIME</span>
+            <strong id="timeLabel">LIVE</strong>
+            <small id="timeStamp">—</small>
+          </div>
+          <button id="timeFutureBtn" type="button" title="Newer frame (Right Arrow)">▶</button>
+          <button id="goLiveBtn" class="go-live" type="button">LIVE</button>
+        </div>
+
+        <label>
+          Range
+          <select id="rangeSelect">
+            <option value="75">75 km</option>
+            <option value="100">100 km</option>
+            <option value="150" selected>150 km</option>
+            <option value="200">200 km</option>
+            <option value="300">300 km</option>
+          </select>
+        </label>
+
+        <label class="switch-label">
+          <input id="smoothToggle" type="checkbox" checked>
+          <span>2-D Smooth</span>
+        </label>
+
+        <button id="wallToggleBtn" type="button">16 Panel</button>
+        <button id="resetViewBtn" type="button">Reset View</button>
+        <button id="refreshBtn" type="button">Refresh</button>
+      </div>
+
+      <div class="scan-sequence-shell">
+        <div class="scan-sequence-title">
+          <span>SCAN ORDER</span>
+          <strong id="scanNowLabel">Waiting for scan metadata…</strong>
+          <span id="scanNextLabel"></span>
+        </div>
+        <div id="scanSequence" class="scan-sequence"></div>
+      </div>
+
+      <div id="singleView" class="radar-shell">
+        <div id="radarStage" class="radar-stage" tabindex="0" aria-label="Interactive radar display. Use mouse wheel or up and down arrow keys to change tilts. Use left and right arrow keys to change time.">
+          <img id="radarImage" alt="KMOB radar sweep">
+
+          <svg id="boundaryOverlay" class="boundary-overlay" aria-hidden="true"></svg>
+
+          <div class="tilt-hud">
+            <div class="tilt-hud-top">
+              <strong id="tiltDegree">—°</strong>
+              <span id="tiltPosition">Tilt —</span>
+            </div>
+            <div id="beamHeightHud" class="beam-height">Move cursor over radar for beam height</div>
+            <div id="cursorHud" class="cursor-hud">Wheel ↑ higher tilt · Wheel ↓ lower tilt</div>
+          </div>
+
+          <div class="nav-hint">Drag pan · wheel zoom · ↑/↓ tilt · ←/→ time</div>
+
+          <svg id="overlay" class="overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">
+            <g class="rings">
+              <circle cx="500" cy="500" r="125"></circle>
+              <circle cx="500" cy="500" r="250"></circle>
+              <circle cx="500" cy="500" r="375"></circle>
+              <circle cx="500" cy="500" r="499"></circle>
+              <line x1="500" y1="0" x2="500" y2="1000"></line>
+              <line x1="0" y1="500" x2="1000" y2="500"></line>
+            </g>
+            <g id="cursorMarker" class="cursor-marker hidden">
+              <circle cx="500" cy="500" r="9"></circle>
+              <line x1="480" y1="500" x2="520" y2="500"></line>
+              <line x1="500" y1="480" x2="500" y2="520"></line>
+            </g>
+          </svg>
+
+          <div class="radar-label north">N</div>
+          <div class="radar-label south">S</div>
+          <div class="radar-label east">E</div>
+          <div class="radar-label west">W</div>
+          <div class="radar-center">KMOB</div>
+        </div>
+      </div>
+
+      <div id="wallView" class="wall-shell hidden">
+        <div class="wall-head">
+          <div>
+            <div class="eyebrow">ANCHOR-RELATIVE TILTS · SHARED PAN / ZOOM</div>
+            <strong>16-Panel Tilt Wall</strong>
+          </div>
+          <div id="wallStatus" class="wall-status">Waiting for live volume…</div>
+        </div>
+        <div id="tiltWall" class="tilt-wall"></div>
+      </div>
+
+      <div class="footer-strip">
+        <span id="productLabel">—</span>
+        <span id="sweepLabel">—</span>
+        <span id="cursorReadout">Move over radar for azimuth, range and beam height</span>
+      </div>
+    </section>
+
+    <aside class="analysis-panel">
+      <div class="analysis-head">
+        <div>
+          <div class="eyebrow">ALL-TILT ANALYSIS</div>
+          <h2>Vertical Inspector</h2>
+        </div>
+        <span id="pointBadge" class="point-badge">No point selected</span>
+      </div>
+
+      <div id="emptyState" class="empty-state">
+        Click anywhere in the PPI to lock a location. Base elevations appear once in the table; SAILS/MRLE supplemental cuts are tracked separately in the live scan-order strip above. Click any row to jump directly to that base elevation.
+      </div>
+
+      <div id="analysisContent" class="hidden">
+        <div class="metric-grid">
+          <div><span>Azimuth</span><strong id="azValue">—</strong></div>
+          <div><span>Range</span><strong id="rangeValue">—</strong></div>
+          <div><span>Current tilt</span><strong id="currentTiltValue">—</strong></div>
+          <div><span>Beam ARL</span><strong id="currentHeightValue">—</strong></div>
+        </div>
+
+        <div class="table-note">Active tilt is highlighted · click a row to jump</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Elev</th>
+                <th>Height</th>
+                <th>REF</th>
+                <th>VEL</th>
+                <th>ZDR</th>
+                <th>CC</th>
+              </tr>
+            </thead>
+            <tbody id="inspectorRows"></tbody>
+          </table>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

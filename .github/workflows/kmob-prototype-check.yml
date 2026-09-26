@@ -1,0 +1,25 @@
+name: KMOB prototype syntax check
+
+on:
+  push:
+    branches: [kmob-level2-prototype]
+  pull_request:
+    paths:
+      - "app.py"
+      - "static/**"
+      - "requirements.txt"
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Python
+        run: python -m py_compile app.py
+      - name: Check browser JavaScript
+        run: node --check static/app.js
+      - name: Verify runtime helpers
+        run: python -c "import ast, pathlib; tree=ast.parse(pathlib.Path('app.py').read_text()); names={n.name for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}; assert '_wall_scan_for_elevation' in names; assert 'api_wall_state' in names; print('runtime helpers OK')"
