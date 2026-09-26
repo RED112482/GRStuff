@@ -378,26 +378,29 @@ def _render_grid(
         int(width),
         int(height),
     )
+
+    # All wall panes normally share this exact geometry.  Keep the first
+    # build inside the lock so parallel workers do not manufacture the same
+    # mesh 16 times; subsequent workers immediately reuse the cached arrays.
     with _RENDER_CACHE_LOCK:
         cached = _RENDER_GRID_CACHE.get(key)
         if cached is not None:
             _RENDER_GRID_CACHE.move_to_end(key)
             return cached
 
-    xs = np.linspace(x_range[0], x_range[1], width, dtype=np.float32)
-    ys = np.linspace(y_range[0], y_range[1], height, dtype=np.float32)
-    xx, yy = np.meshgrid(xs, ys)
-    rr = np.hypot(xx, yy).astype(np.float32)
-    az = ((np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0).astype(
-        np.float32
-    )
+        xs = np.linspace(x_range[0], x_range[1], width, dtype=np.float32)
+        ys = np.linspace(y_range[0], y_range[1], height, dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        rr = np.hypot(xx, yy).astype(np.float32)
+        az = ((np.degrees(np.arctan2(xx, yy)) + 360.0) % 360.0).astype(
+            np.float32
+        )
 
-    with _RENDER_CACHE_LOCK:
         _RENDER_GRID_CACHE[key] = (rr, az)
         _RENDER_GRID_CACHE.move_to_end(key)
         while len(_RENDER_GRID_CACHE) > 12:
             _RENDER_GRID_CACHE.popitem(last=False)
-    return rr, az
+        return rr, az
 
 
 def render_scan(
