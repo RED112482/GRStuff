@@ -1,48 +1,64 @@
 # KMOB Level-II Volume Explorer — Prototype
 
-Interactive NEXRAD Level-II interrogation prototype for **KMOB**.
+Interactive NEXRAD Level-II interrogation prototype for **KMOB**, including true tilt-as-it-arrives streaming.
 
-## Current rapid-interrogation build
+## Current build
 
-- Polls the public AWS `unidata-nexrad-level2` completed-volume bucket every **5 seconds** for a newer KMOB volume.
-- Limits S3 discovery to the most recent hours instead of repeatedly listing an entire day.
-- Uses a fast NumPy/Pillow polar rasterizer instead of rebuilding every PPI through Matplotlib.
-- Caches rendered sweeps and preloads the immediately adjacent tilts.
-- Supports rapid tilt stepping:
-  - **Up Arrow** = next higher tilt
-  - **Down Arrow** = next lower tilt
-  - Mouse wheel **up** over the radar = higher tilt
-  - Mouse wheel **down** over the radar = lower tilt
-  - Click a row in the Vertical Inspector to jump to that tilt
-- Large on-radar HUD displays:
-  - current elevation angle
-  - tilt number
-  - cursor azimuth/range
-  - approximate beam-center height in kft ARL
-- Clicking a point locks an all-tilt vertical inspection and uses Py-ART gate geometry for the exact beam-center height at that location.
-- Optional **2-D Smooth** mode performs bilinear interpolation between neighboring azimuth/range samples in the displayed sweep.
-- New volumes preserve the nearest current elevation and automatically refresh a locked interrogation point.
+### Live Level-II ingest
+- Uses the AWS `unidata-nexrad-level2-chunks` real-time bucket when Xradar 0.12+ is installed.
+- Xradar opens partial volumes with `incomplete_sweep="pad"`, allowing the current elevation to appear before the full 360° sweep or volume is finished.
+- Falls back to the completed `unidata-nexrad-level2` archive if the chunk stream is temporarily unavailable.
+- A blinking **LIVE** light is shown only when viewing frame 0 from the chunk stream.
 
-## Radar moments
+### Base tilts only
+Supplemental/repeat elevations are suppressed in the user-facing tilt list:
+- SAILS repeats are not shown as additional 0.18°/lowest-elevation tilts.
+- MRLE repeated low elevations are also excluded.
+- Consecutive same-elevation split cuts are grouped into one logical tilt so the viewer can still select the appropriate radar moment without displaying duplicate elevations.
 
-- Reflectivity
-- Velocity
-- ZDR
-- Correlation Coefficient
-- Differential Phase
-- Spectrum Width
+### Interrogation controls
+- Mouse wheel over the radar: step vertically through tilts.
+- **Up / Down Arrow**: higher/lower tilt.
+- **Left / Right Arrow**: older/newer volume.
+- Rolling archive history of about **10 completed volumes**.
+- LIVE button jumps back to the newest chunk-stream frame.
+- Click a radar point for an all-tilt vertical inspector.
+- Beam-center height shown in kft ARL.
+- Optional 2-D polar interpolation.
 
-## Windows setup
+### 16-panel tilt wall
+- Toggle between single-panel interrogation and a **4×4 / 16-panel** display.
+- Displays up to the first 16 unique base elevations.
+- Each panel updates when new live chunks arrive.
+- The currently incomplete scan shows its approximate receive percentage.
+- Clicking a panel jumps back to single-panel interrogation at that elevation.
 
-The recommended environment is Conda/Miniconda with Python 3.11.
+### Map reference
+- State and county outlines are downloaded once from the U.S. Census Bureau 2025 5m Cartographic Boundary files and cached locally.
+- Boundaries are projected into radar-relative coordinates and stay aligned with the PPI at each display range.
+
+## Windows setup / update
+
+Activate the existing environment:
 
 ```powershell
-conda create -n kmob-radar --solver=libmamba --override-channels -c conda-forge python=3.11 arm_pyart pip -y
 conda activate kmob-radar
-python -m pip install fastapi "uvicorn[standard]" boto3
 ```
 
-Then launch from the project directory:
+Install/upgrade Xradar for true streaming support:
+
+```powershell
+conda install -n kmob-radar --solver=libmamba --override-channels -c conda-forge "xradar>=0.12,<0.13" -y
+```
+
+Then update the branch:
+
+```powershell
+git checkout kmob-level2-prototype
+git pull origin kmob-level2-prototype
+```
+
+Launch:
 
 ```powershell
 python -m uvicorn app:app --host 127.0.0.1 --port 8000
@@ -54,38 +70,34 @@ Open:
 http://127.0.0.1:8000
 ```
 
+The first state/county overlay request may take a little longer because the Census boundary ZIPs are downloaded and extracted once. Subsequent runs use the local boundary cache.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `RADAR_ID` | `KMOB` | Radar ICAO ID |
-| `NEXRAD_BUCKET` | `unidata-nexrad-level2` | Completed-volume AWS bucket |
-| `POLL_SECONDS` | `5` | Frequency to check for a newer completed volume |
+| `NEXRAD_BUCKET` | `unidata-nexrad-level2` | Completed-volume history bucket |
+| `NEXRAD_CHUNK_BUCKET` | `unidata-nexrad-level2-chunks` | Real-time chunk bucket |
+| `POLL_SECONDS` | `2` | Live chunk check interval |
+| `HISTORY_FRAMES` | `10` | Completed volumes retained in the time navigator |
 | `DEFAULT_RANGE_KM` | `150` | Initial display radius |
-| `RADAR_RASTER_SIZE` | `640` | PPI raster dimensions; lower is faster |
-| `RADAR_CACHE_DIR` | OS temp directory | Download cache |
+| `RADAR_RASTER_SIZE` | `640` | Main PPI raster size |
+| `RADAR_CACHE_DIR` | OS temp directory | Level-II and boundary cache |
 
-## Current API
+## Controls
 
-- `GET /api/status` — ingest/freshness status
-- `POST /api/refresh` — force an AWS check
-- `GET /api/volume` — current volume metadata, fields, and sweeps
-- `GET /api/image/{field}/{sweep}.png?range_km=150&smooth=true` — cached/interpolated PPI
-- `GET /api/inspect?x_km=...&y_km=...` — all-tilt vertical inspection
+| Control | Action |
+|---|---|
+| Mouse wheel | Step through tilts |
+| ↑ / ↓ | Step through tilts |
+| ← / → | Older / newer volume |
+| LIVE | Return to real-time frame |
+| 16 Panel | Toggle the all-tilt wall |
+| Click PPI | Lock a vertical interrogation point |
 
-## Important latency distinction
+## Data sources
 
-This build is now much faster for **interrogating the volume already loaded**, but it still reads the AWS **completed-volume** Level-II source. A 5-second poll cannot make a not-yet-completed volume appear early.
-
-The next ingest phase is the real-time `unidata-nexrad-level2-chunks` source using Xradar's streaming NEXRAD reader. That source can expose incomplete/current sweeps while the radar is still collecting the volume, which is the path to true tilt-as-it-arrives operation.
-
-## Next development targets
-
-1. Xradar Level-II chunk ingestion with incomplete sweeps padded in real time.
-2. Current-scan progress display showing which tilt is actively arriving.
-3. A→B vertical cross-sections.
-4. Time-height history for a locked storm point.
-5. Derived echo-top/core-height products.
-6. ZDR/KDP/CC column analysis.
-7. Rotation-depth / azimuthal-shear analysis.
-8. Storm-centered 3-D volumes.
+- NOAA/NEXRAD Level-II via AWS Open Data.
+- Real-time Level-II chunk stream via `unidata-nexrad-level2-chunks`.
+- U.S. Census Bureau generalized state and county boundaries.
