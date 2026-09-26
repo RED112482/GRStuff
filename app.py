@@ -828,15 +828,111 @@ def _live_tilt_completion(tilt: dict[str, Any]) -> float:
     return min(100.0, best)
 
 
+def _scan_label(scan: dict[str, Any]) -> str:
+    kind = str(scan.get("kind", "BASE"))
+    elevation = float(scan.get("elevation", 0.0))
+    number = int(scan.get("sequence_number", 0) or 0)
+    if kind in {"SAILS", "MRLE"}:
+        return f"{kind} #{number} · {elevation:.2f}°"
+    return f"{elevation:.2f}°"
+
+
+def _public_scan(scan: dict[str, Any], completion: float | None = None) -> dict[str, Any]:
+    payload = {
+        "sequence_index": int(scan.get("sequence_index", 0)),
+        "elevation": round(float(scan.get("elevation", 0.0)), 2),
+        "kind": str(scan.get("kind", "BASE")),
+        "sequence_number": int(scan.get("sequence_number", 0) or 0),
+        "split_cut": bool(scan.get("split_cut", False)),
+        "base_tilt_cut": bool(scan.get("base_tilt_cut", False)),
+        "label": _scan_label(scan),
+    }
+    if completion is not None:
+        payload["completion"] = round(float(completion), 1)
+    return payload
+
+
+def _live_panel_sweeps(
+    live_tilts: list[dict[str, Any]],
+    template_sequence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    template_base = _base_tilts_from_sequence(template_sequence)
+    expected = template_base if template_base else list(live_tilts)
+
+    # Include an elevation that appears in the current live volume even if the
+    # preceding completed volume used a different AVSET/VCP termination.
+    for live_tilt in live_tilts:
+        if not any(
+            _angle_matches(live_tilt["elevation"], item["elevation"])
+            for item in expected
+        ):
+            expected.append({
+                "index": len(expected),
+                "elevation": live_tilt["elevation"],
+                "raw": [],
+                "sequence_index": live_tilt.get("sequence_index", -1),
+                "kind": "BASE",
+            })
+
+    panels: list[dict[str, Any]] = []
+    for panel_index, expected_tilt in enumerate(expected[:16]):
+        available = next(
+            (
+                tilt for tilt in live_tilts
+                if _angle_matches(tilt["elevation"], expected_tilt["elevation"])
+            ),
+            None,
+        )
+        panels.append({
+            "panel_index": panel_index,
+            "elevation": round(float(expected_tilt["elevation"]), 2),
+            "available": available is not None,
+            "index": int(available["index"]) if available is not None else None,
+            "completion": (
+                round(_live_tilt_completion(available), 1)
+                if available is not None else 0.0
+            ),
+        })
+    return panels
+
+
+def _sequence_status(
+    live_sequence: list[dict[str, Any]],
+    template_sequence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current = None
+    if live_sequence:
+        scan = live_sequence[-1]
+        current = _public_scan(scan, _live_tilt_completion(scan))
+
+    expected_next = None
+    if template_sequence and len(live_sequence) < len(template_sequence):
+        expected_next = _public_scan(template_sequence[len(live_sequence)])
+
+    return {
+        "current": current,
+        "expected_next": expected_next,
+        "observed_count": len(live_sequence),
+        "expected_count": len(template_sequence) if template_sequence else None,
+    }
+
+
 @app.get("/api/volume")
 def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]:
-    if frame == 0:
+    frames = _history_frames_metadata()
+    if frame >= len(frames):
+        raise HTTPException(status_code=404, detail="History frame is not available.")
+
+    frame_meta = frames[frame]
+
+    if frame_meta["source"] == "live":
         with live_lock:
             tree = live_tree
 
         if tree is not None:
             latitude, longitude, altitude = _live_root_values()
-            tilts = _live_base_tilts(tree)
+            live_sequence = _live_scan_sequence(tree)
+            tilts = _base_tilts_from_sequence(live_sequence)
             fields: list[str] = []
 
             for field in FIELD_CONFIG:
@@ -862,6 +958,17 @@ def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]
                 "raw_count": len(tilt["raw"]),
             } for tilt in tilts]
 
+            template_sequence: list[dict[str, Any]] = []
+            if archive_history:
+                template_sequence = _xradar_sequence_for_archive(
+                    archive_history[0]["key"]
+                )
+
+            sequence_public = [
+                _public_scan(scan, _live_tilt_completion(scan))
+                for scan in live_sequence
+            ]
+
             return {
                 "radar": RADAR_ID,
                 "source": "live",
@@ -874,13 +981,17 @@ def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]
                 "altitude_m": altitude,
                 "fields": [{"id": name, **FIELD_CONFIG[name]} for name in fields],
                 "sweeps": sweeps,
-                "frame": 0,
+                "panel_sweeps": _live_panel_sweeps(tilts, template_sequence),
+                "scan_sequence": sequence_public,
+                "scan_status": _sequence_status(live_sequence, template_sequence),
+                "frame": frame,
                 "live_complete": live_complete,
             }
 
     radar, entry = _archive_frame(frame)
     tilts = _archive_base_tilts(radar)
     fields = [name for name in FIELD_CONFIG if name in radar.fields]
+    sequence = _xradar_sequence_for_archive(entry["key"])
 
     sweeps = [{
         "index": tilt["index"],
@@ -888,6 +999,14 @@ def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]
         "completion": 100.0,
         "raw_count": len(tilt["raw"]),
     } for tilt in tilts]
+
+    panel_sweeps = [{
+        "panel_index": idx,
+        "elevation": item["elevation"],
+        "available": True,
+        "index": item["index"],
+        "completion": 100.0,
+    } for idx, item in enumerate(sweeps[:16])]
 
     return {
         "radar": RADAR_ID,
@@ -904,6 +1023,14 @@ def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]
         "altitude_m": float(radar.altitude["data"][0]),
         "fields": [{"id": name, **FIELD_CONFIG[name]} for name in fields],
         "sweeps": sweeps,
+        "panel_sweeps": panel_sweeps,
+        "scan_sequence": [_public_scan(scan, 100.0) for scan in sequence],
+        "scan_status": {
+            "current": None,
+            "expected_next": None,
+            "observed_count": len(sequence),
+            "expected_count": len(sequence),
+        },
         "frame": frame,
         "live_complete": True,
     }
