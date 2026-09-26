@@ -781,12 +781,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._syncing_ranges = False
         self._wall_mode = False
 
-        self._build_ui()
-
+        # Range-change signals can fire while widgets are being constructed,
+        # so create the debounce timer before _build_ui() connects any view.
         self.render_timer = QtCore.QTimer(self)
         self.render_timer.setSingleShot(True)
         self.render_timer.setInterval(100)
         self.render_timer.timeout.connect(self._rerender_visible)
+
+        self._build_ui()
 
         self.worker = RadarDataWorker()
         self.worker.snapshot.connect(self._apply_snapshot)
@@ -1068,7 +1070,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     canvas.rerender()
 
     def _view_changed(self, source: RadarCanvas):
-        if self._syncing_ranges:
+        if self._syncing_ranges or not hasattr(self, "render_timer"):
             return
         x_range, y_range = source.visible_ranges()
         self._syncing_ranges = True
