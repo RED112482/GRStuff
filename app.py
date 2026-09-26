@@ -151,55 +151,331 @@ def _clear_render_cache() -> None:
         image_cache.clear()
 
 
-def load_key(key: str) -> None:
-    local_path = CACHE_DIR / key.rsplit("/", 1)[-1]
+def _is_archive_volume_key(key: str) -> bool:
+    name = key.rsplit("/", 1)[-1]
+    if "_MDM" in name or not name.startswith(RADAR_ID):
+        return False
+    return "_V06" in name or name.endswith(".gz")
+
+
+def _scan_archive_history(limit: int = HISTORY_FRAMES) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    found: list[dict[str, Any]] = []
+
+    for prefix in _candidate_prefixes(now):
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not _is_archive_volume_key(key):
+                    continue
+                found.append({
+                    "key": key,
+                    "last_modified": obj["LastModified"],
+                    "volume_time": _volume_time_from_key(key),
+                })
+
+    found.sort(key=lambda item: item["last_modified"], reverse=True)
+    dedup: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in found:
+        if item["key"] in seen:
+            continue
+        seen.add(item["key"])
+        dedup.append(item)
+        if len(dedup) >= limit:
+            break
+    return dedup
+
+
+def _archive_local_path(key: str) -> Path:
+    return CACHE_DIR / key.rsplit("/", 1)[-1]
+
+
+def _load_archive_radar(key: str):
+    with archive_lock:
+        cached = archive_radar_cache.get(key)
+        if cached is not None:
+            archive_radar_cache.move_to_end(key)
+            return cached
+
+    local_path = _archive_local_path(key)
     if not local_path.exists():
+        print(f"[ARCHIVE] downloading {key}", flush=True)
         s3.download_file(BUCKET, key, str(local_path))
 
     radar = pyart.io.read_nexrad_archive(str(local_path), station=RADAR_ID)
 
-    with state_lock:
-        old_path = state.file_path
-        state.radar = radar
-        state.key = key
-        state.volume_time = _volume_time_from_key(key)
-        state.loaded_at = datetime.now(timezone.utc)
-        state.file_path = local_path
-        state.error = None
-
-    _clear_render_cache()
-
-    if old_path and old_path != local_path and old_path.exists():
-        try:
-            old_path.unlink()
-        except OSError:
-            pass
+    with archive_lock:
+        archive_radar_cache[key] = radar
+        archive_radar_cache.move_to_end(key)
+        while len(archive_radar_cache) > 3:
+            archive_radar_cache.popitem(last=False)
+    return radar
 
 
-def refresh_volume() -> bool:
+def refresh_archive_history() -> bool:
+    global archive_history
     try:
-        key = find_latest_key()
+        new_history = _scan_archive_history()
+        if not new_history:
+            raise RuntimeError(f"No recent Level-II files found for {RADAR_ID}.")
+
+        old_key = archive_history[0]["key"] if archive_history else None
+        archive_history = new_history
+        newest = new_history[0]
+        changed = newest["key"] != old_key
+
         with state_lock:
-            if key == state.key and state.radar is not None:
-                return False
-        load_key(key)
-        return True
+            need_radar = state.radar is None or state.key != newest["key"]
+
+        if need_radar:
+            radar = _load_archive_radar(newest["key"])
+            with state_lock:
+                state.radar = radar
+                state.key = newest["key"]
+                state.volume_time = newest["volume_time"]
+                state.loaded_at = datetime.now(timezone.utc)
+                state.file_path = _archive_local_path(newest["key"])
+                state.error = None
+
+        if changed:
+            print(f"[ARCHIVE] newest {RADAR_ID}: {newest['key']}", flush=True)
+            _clear_render_cache()
+
+        return changed
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
-        print(f"[NEXRAD ERROR] {message}", flush=True)
+        print(f"[ARCHIVE ERROR] {message}", flush=True)
         with state_lock:
             state.error = message
         return False
 
 
+def _angle_matches(a: float, b: float, tolerance: float = 0.06) -> bool:
+    return abs(float(a) - float(b)) <= tolerance
+
+
+def _group_base_tilts(items: list[tuple[Any, float]]) -> list[dict[str, Any]]:
+    """Keep the first ascending occurrence of each elevation; ignore later SAILS/MRLE repeats.
+
+    Consecutive same-angle raw sweeps remain grouped so split-cut moments can still be
+    selected from the same physical base elevation.
+    """
+    logical: list[dict[str, Any]] = []
+    seen_angles: list[float] = []
+    i = 0
+
+    while i < len(items):
+        raw_id, elevation = items[i]
+        raw_group = [raw_id]
+        j = i + 1
+
+        while j < len(items) and _angle_matches(items[j][1], elevation):
+            raw_group.append(items[j][0])
+            j += 1
+
+        if not any(_angle_matches(elevation, seen) for seen in seen_angles):
+            logical.append({
+                "index": len(logical),
+                "elevation": float(elevation),
+                "raw": raw_group,
+            })
+            seen_angles.append(float(elevation))
+
+        i = j
+
+    return logical
+
+
+def _archive_base_tilts(radar) -> list[dict[str, Any]]:
+    fixed = np.asarray(radar.fixed_angle["data"], dtype=float)
+    items = [(idx, float(elev)) for idx, elev in enumerate(fixed)]
+    return _group_base_tilts(items)
+
+
+XR_FIELD_MAP = {
+    "reflectivity": ("DBZH", "DBZ", "REF"),
+    "velocity": ("VRADH", "VRAD", "VEL"),
+    "differential_reflectivity": ("ZDR",),
+    "cross_correlation_ratio": ("RHOHV", "RHOHV_NC"),
+    "differential_phase": ("PHIDP",),
+    "spectrum_width": ("WRADH", "WIDTH"),
+}
+
+
+def _live_sweep_groups(tree=None) -> list[str]:
+    tree = tree if tree is not None else live_tree
+    if tree is None:
+        return []
+
+    groups = []
+    for group in getattr(tree, "groups", ()):
+        name = str(group)
+        if name.startswith("/sweep_"):
+            groups.append(name)
+
+    def sort_key(name: str) -> int:
+        match = re.search(r"sweep_(\d+)$", name)
+        return int(match.group(1)) if match else 9999
+
+    return sorted(groups, key=sort_key)
+
+
+def _live_base_tilts(tree=None) -> list[dict[str, Any]]:
+    tree = tree if tree is not None else live_tree
+    items: list[tuple[str, float]] = []
+
+    if tree is None:
+        return []
+
+    for group in _live_sweep_groups(tree):
+        try:
+            ds = tree[group].to_dataset(inherit="all_coords")
+            elevation = float(np.asarray(ds["sweep_fixed_angle"].values).reshape(-1)[0])
+            items.append((group, elevation))
+        except Exception:
+            continue
+
+    return _group_base_tilts(items)
+
+
+def _chunk_volume_prefix_and_keys() -> tuple[str | None, list[dict[str, Any]]]:
+    if not XRADAR_AVAILABLE:
+        return None, []
+
+    root = f"{RADAR_ID}/"
+    response = s3_chunks.list_objects_v2(
+        Bucket=CHUNK_BUCKET,
+        Prefix=root,
+        Delimiter="/",
+    )
+    prefixes = [item["Prefix"] for item in response.get("CommonPrefixes", [])]
+
+    candidates: list[tuple[datetime, str, list[dict[str, Any]]]] = []
+    for prefix in prefixes:
+        listing = s3_chunks.list_objects_v2(Bucket=CHUNK_BUCKET, Prefix=prefix)
+        objects = listing.get("Contents", [])
+        if not objects:
+            continue
+        newest = max(obj["LastModified"] for obj in objects)
+        candidates.append((newest, prefix, objects))
+
+    if not candidates:
+        return None, []
+
+    _, prefix, objects = max(candidates, key=lambda item: item[0])
+    objects.sort(key=lambda obj: obj["Key"])
+    return prefix, objects
+
+
+def _chunk_time_from_key(key: str) -> datetime | None:
+    name = key.rsplit("/", 1)[-1]
+    match = re.search(r"(\d{8})-(\d{6})", name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(
+            match.group(1) + match.group(2), "%Y%m%d%H%M%S"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def refresh_live_chunks() -> bool:
+    global live_prefix, live_chunk_bytes, live_tree, live_token
+    global live_volume_time, live_updated_at, live_complete, live_error
+
+    if not XRADAR_AVAILABLE:
+        with live_lock:
+            live_error = "Xradar 0.12+ is required for tilt-as-it-arrives streaming."
+        return False
+
+    try:
+        prefix, objects = _chunk_volume_prefix_and_keys()
+        if not prefix or not objects:
+            raise RuntimeError(f"No real-time chunk volume found for {RADAR_ID}.")
+
+        with live_lock:
+            if prefix != live_prefix:
+                live_prefix = prefix
+                live_chunk_bytes = {}
+                live_tree = None
+                live_token = None
+
+        for obj in objects:
+            key = obj["Key"]
+            with live_lock:
+                have_key = key in live_chunk_bytes
+            if have_key:
+                continue
+            body = s3_chunks.get_object(Bucket=CHUNK_BUCKET, Key=key)["Body"].read()
+            with live_lock:
+                live_chunk_bytes[key] = body
+
+        with live_lock:
+            ordered_keys = sorted(live_chunk_bytes)
+            candidate = [live_chunk_bytes[key] for key in ordered_keys]
+
+        if not candidate:
+            return False
+
+        tree = xd.io.open_nexradlevel2_datatree(
+            candidate,
+            incomplete_sweep="pad",
+        )
+        groups = _live_sweep_groups(tree)
+        if not groups:
+            return False
+
+        last_obj = max(objects, key=lambda obj: obj["LastModified"])
+        token = f"{prefix}:{len(ordered_keys)}:{int(last_obj['LastModified'].timestamp())}"
+        complete = any(re.search(r"-\d+-E$", key.rsplit("/", 1)[-1]) for key in ordered_keys)
+
+        with live_lock:
+            changed = token != live_token
+            live_tree = tree
+            live_token = token
+            live_volume_time = _chunk_time_from_key(ordered_keys[0])
+            live_updated_at = datetime.now(timezone.utc)
+            live_complete = complete
+            live_error = None
+
+        if changed:
+            print(
+                f"[LIVE] {RADAR_ID} {len(ordered_keys)} chunks · "
+                f"{len(_live_base_tilts(tree))} base tilts · {'complete' if complete else 'scanning'}",
+                flush=True,
+            )
+            _clear_render_cache()
+
+        return changed
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        with live_lock:
+            live_error = message
+        print(f"[LIVE ERROR] {message}", flush=True)
+        return False
+
+
 async def poll_loop() -> None:
+    archive_counter = 0
     while True:
-        await asyncio.to_thread(refresh_volume)
+        await asyncio.to_thread(refresh_live_chunks)
+
+        if archive_counter <= 0:
+            await asyncio.to_thread(refresh_archive_history)
+            archive_counter = max(1, int(10 / max(POLL_SECONDS, 1)))
+        else:
+            archive_counter -= 1
+
         await asyncio.sleep(POLL_SECONDS)
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    await asyncio.to_thread(refresh_archive_history)
+    await asyncio.to_thread(refresh_live_chunks)
     asyncio.create_task(poll_loop())
 
 
@@ -207,29 +483,75 @@ def get_radar():
     with state_lock:
         radar = state.radar
     if radar is None:
-        refresh_volume()
+        refresh_archive_history()
         with state_lock:
             radar = state.radar
     if radar is None:
-        raise HTTPException(status_code=503, detail=state.error or "Radar volume is not loaded yet.")
+        raise HTTPException(
+            status_code=503,
+            detail=state.error or "Radar volume is not loaded yet.",
+        )
     return radar
 
 
+def _live_root_values() -> tuple[float, float, float]:
+    with live_lock:
+        tree = live_tree
+    if tree is None:
+        raise RuntimeError("Live chunk volume is not available.")
+
+    root = tree["/"].to_dataset()
+    latitude = float(np.asarray(root["latitude"].values).reshape(-1)[0])
+    longitude = float(np.asarray(root["longitude"].values).reshape(-1)[0])
+    altitude = float(np.asarray(root["altitude"].values).reshape(-1)[0])
+    return latitude, longitude, altitude
+
+
 def _state_snapshot() -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+
     with state_lock:
-        now = datetime.now(timezone.utc)
-        age_seconds = (now - state.volume_time).total_seconds() if state.volume_time else None
-        return {
-            "radar": RADAR_ID,
-            "bucket": BUCKET,
-            "loaded": state.radar is not None,
-            "key": state.key,
-            "volume_time": state.volume_time.isoformat() if state.volume_time else None,
-            "loaded_at": state.loaded_at.isoformat() if state.loaded_at else None,
-            "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
-            "poll_seconds": POLL_SECONDS,
-            "error": state.error,
-        }
+        archive_age = (
+            (now - state.volume_time).total_seconds()
+            if state.volume_time else None
+        )
+        archive_loaded = state.radar is not None
+        archive_error = state.error
+
+    with live_lock:
+        live_age = (
+            (now - live_volume_time).total_seconds()
+            if live_volume_time else None
+        )
+        live_available = live_tree is not None
+        token = live_token
+        updated = live_updated_at
+        complete = live_complete
+        error = live_error
+        chunk_count = len(live_chunk_bytes)
+
+    return {
+        "radar": RADAR_ID,
+        "bucket": BUCKET,
+        "chunk_bucket": CHUNK_BUCKET,
+        "loaded": live_available or archive_loaded,
+        "archive_loaded": archive_loaded,
+        "archive_key": state.key,
+        "archive_volume_time": state.volume_time.isoformat() if state.volume_time else None,
+        "archive_age_seconds": round(archive_age, 1) if archive_age is not None else None,
+        "live_available": live_available,
+        "live_token": token,
+        "live_volume_time": live_volume_time.isoformat() if live_volume_time else None,
+        "live_age_seconds": round(live_age, 1) if live_age is not None else None,
+        "live_updated_at": updated.isoformat() if updated else None,
+        "live_complete": complete,
+        "live_chunk_count": chunk_count,
+        "poll_seconds": POLL_SECONDS,
+        "history_frames": len(archive_history),
+        "xradar_available": XRADAR_AVAILABLE,
+        "live_error": error,
+        "error": archive_error,
+    }
 
 
 @app.get("/api/status")
@@ -239,38 +561,177 @@ def api_status() -> dict[str, Any]:
 
 @app.post("/api/refresh")
 def api_refresh() -> dict[str, Any]:
-    changed = refresh_volume()
-    return {"changed": changed, **_state_snapshot()}
+    live_changed = refresh_live_chunks()
+    archive_changed = refresh_archive_history()
+    return {
+        "changed": live_changed or archive_changed,
+        "live_changed": live_changed,
+        "archive_changed": archive_changed,
+        **_state_snapshot(),
+    }
+
+
+@app.get("/api/history")
+def api_history() -> dict[str, Any]:
+    frames = [{
+        "frame": 0,
+        "source": "live" if live_tree is not None else "archive",
+        "key": live_token if live_tree is not None else (archive_history[0]["key"] if archive_history else None),
+        "volume_time": (
+            live_volume_time.isoformat()
+            if live_tree is not None and live_volume_time
+            else (
+                archive_history[0]["volume_time"].isoformat()
+                if archive_history and archive_history[0]["volume_time"]
+                else None
+            )
+        ),
+        "label": "LIVE" if live_tree is not None else "LATEST",
+    }]
+
+    for idx, item in enumerate(archive_history[:HISTORY_FRAMES], start=1):
+        frames.append({
+            "frame": idx,
+            "source": "archive",
+            "key": item["key"],
+            "volume_time": item["volume_time"].isoformat() if item["volume_time"] else None,
+            "label": f"-{idx}",
+        })
+
+    return {"frames": frames, "max_frame": max(0, len(frames) - 1)}
+
+
+def _archive_frame(frame: int) -> tuple[Any, dict[str, Any]]:
+    if not archive_history:
+        refresh_archive_history()
+
+    archive_index = max(0, frame - 1)
+    if frame == 0 and live_tree is None:
+        archive_index = 0
+
+    if archive_index >= len(archive_history):
+        raise HTTPException(status_code=404, detail="History frame is not available.")
+
+    entry = archive_history[archive_index]
+    return _load_archive_radar(entry["key"]), entry
+
+
+def _live_field_name(ds, field: str) -> str | None:
+    for candidate in XR_FIELD_MAP.get(field, ()):
+        if candidate in ds.data_vars:
+            return candidate
+    return None
+
+
+def _live_tilt_completion(tilt: dict[str, Any]) -> float:
+    with live_lock:
+        tree = live_tree
+    if tree is None:
+        return 0.0
+
+    best = 0.0
+    for group in tilt["raw"]:
+        try:
+            ds = tree[group].to_dataset(inherit="all_coords")
+        except Exception:
+            continue
+
+        for field in ("reflectivity", "velocity", "differential_reflectivity"):
+            var_name = _live_field_name(ds, field)
+            if not var_name:
+                continue
+            arr = np.asarray(ds[var_name].values)
+            if arr.ndim < 2:
+                continue
+            if "range" in ds[var_name].dims:
+                range_axis = ds[var_name].dims.index("range")
+            else:
+                range_axis = arr.ndim - 1
+            valid_rays = np.any(np.isfinite(arr), axis=range_axis)
+            pct = float(np.mean(valid_rays)) * 100.0
+            best = max(best, pct)
+
+    return min(100.0, best)
 
 
 @app.get("/api/volume")
-def api_volume() -> dict[str, Any]:
-    radar = get_radar()
-    fixed = np.asarray(radar.fixed_angle["data"], dtype=float)
+def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]:
+    if frame == 0:
+        with live_lock:
+            tree = live_tree
+
+        if tree is not None:
+            latitude, longitude, altitude = _live_root_values()
+            tilts = _live_base_tilts(tree)
+            fields: list[str] = []
+
+            for field in FIELD_CONFIG:
+                found = False
+                for tilt in tilts:
+                    for group in tilt["raw"]:
+                        try:
+                            ds = tree[group].to_dataset(inherit="all_coords")
+                            if _live_field_name(ds, field):
+                                found = True
+                                break
+                        except Exception:
+                            pass
+                    if found:
+                        break
+                if found:
+                    fields.append(field)
+
+            sweeps = [{
+                "index": tilt["index"],
+                "elevation": round(tilt["elevation"], 2),
+                "completion": round(_live_tilt_completion(tilt), 1),
+                "raw_count": len(tilt["raw"]),
+            } for tilt in tilts]
+
+            return {
+                "radar": RADAR_ID,
+                "source": "live",
+                "key": live_token,
+                "volume_time": live_volume_time.isoformat() if live_volume_time else None,
+                "loaded_at": live_updated_at.isoformat() if live_updated_at else None,
+                "age_seconds": _state_snapshot()["live_age_seconds"],
+                "latitude": latitude,
+                "longitude": longitude,
+                "altitude_m": altitude,
+                "fields": [{"id": name, **FIELD_CONFIG[name]} for name in fields],
+                "sweeps": sweeps,
+                "frame": 0,
+                "live_complete": live_complete,
+            }
+
+    radar, entry = _archive_frame(frame)
+    tilts = _archive_base_tilts(radar)
     fields = [name for name in FIELD_CONFIG if name in radar.fields]
-    sweeps = []
 
-    for sweep in range(radar.nsweeps):
-        start = int(radar.sweep_start_ray_index["data"][sweep])
-        end = int(radar.sweep_end_ray_index["data"][sweep])
-        sweeps.append({
-            "index": sweep,
-            "elevation": round(float(fixed[sweep]), 2),
-            "rays": end - start + 1,
-        })
+    sweeps = [{
+        "index": tilt["index"],
+        "elevation": round(tilt["elevation"], 2),
+        "completion": 100.0,
+        "raw_count": len(tilt["raw"]),
+    } for tilt in tilts]
 
-    snap = _state_snapshot()
     return {
         "radar": RADAR_ID,
-        "key": snap["key"],
-        "volume_time": snap["volume_time"],
-        "loaded_at": snap["loaded_at"],
-        "age_seconds": snap["age_seconds"],
+        "source": "archive",
+        "key": entry["key"],
+        "volume_time": entry["volume_time"].isoformat() if entry["volume_time"] else None,
+        "loaded_at": None,
+        "age_seconds": (
+            round((datetime.now(timezone.utc) - entry["volume_time"]).total_seconds(), 1)
+            if entry["volume_time"] else None
+        ),
         "latitude": float(radar.latitude["data"][0]),
         "longitude": float(radar.longitude["data"][0]),
         "altitude_m": float(radar.altitude["data"][0]),
         "fields": [{"id": name, **FIELD_CONFIG[name]} for name in fields],
         "sweeps": sweeps,
+        "frame": frame,
+        "live_complete": True,
     }
 
 
