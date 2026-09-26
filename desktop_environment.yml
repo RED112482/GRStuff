@@ -10,3 +10,5 @@ dependencies:
   - pyside6>=6.11,<6.12
   - pyqtgraph=0.14.*
   - numba
+  - pyproj
+  - pyshp
