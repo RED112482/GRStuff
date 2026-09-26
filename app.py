@@ -963,6 +963,22 @@ def api_volume(frame: int = Query(0, ge=0, le=HISTORY_FRAMES)) -> dict[str, Any]
                 template_sequence = _xradar_sequence_for_archive(
                     archive_history[0]["key"]
                 )
+                if not template_sequence:
+                    # Keep the 16-panel wall useful even if Xradar cannot
+                    # extract supplemental metadata from the prior archive.
+                    prior_radar = _load_archive_radar(archive_history[0]["key"])
+                    template_sequence = [
+                        {
+                            "sequence_index": idx,
+                            "elevation": tilt["elevation"],
+                            "kind": "BASE",
+                            "sequence_number": 0,
+                            "raw": [],
+                            "split_cut": False,
+                            "base_tilt_cut": False,
+                        }
+                        for idx, tilt in enumerate(_archive_base_tilts(prior_radar))
+                    ]
 
             sequence_public = [
                 _public_scan(scan, _live_tilt_completion(scan))
