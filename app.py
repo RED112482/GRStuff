@@ -59,12 +59,11 @@ app = FastAPI(title="KMOB Level-II Volume Explorer", version="0.2.0")
 
 
 def _candidate_prefixes(now: datetime) -> list[str]:
-    """Query only the current/recent hours instead of listing the entire day."""
-    prefixes: list[str] = []
-    for hours_back in range(3):
-        d = now - timedelta(hours=hours_back)
-        prefixes.append(f"{d:%Y/%m/%d}/{RADAR_ID}/{RADAR_ID}{d:%Y%m%d_%H}")
-    return prefixes
+    """Return robust day/site prefixes, newest day first."""
+    return [
+        f"{now:%Y/%m/%d}/{RADAR_ID}/",
+        f"{(now - timedelta(days=1)):%Y/%m/%d}/{RADAR_ID}/",
+    ]
 
 
 def _volume_time_from_key(key: str) -> datetime | None:
@@ -77,20 +76,34 @@ def _volume_time_from_key(key: str) -> datetime | None:
 
 
 def find_latest_key() -> str:
-    candidates: list[tuple[datetime, str]] = []
-    for prefix in _candidate_prefixes(datetime.now(timezone.utc)):
-        response = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
-        for obj in response.get("Contents", []):
-            key = obj["Key"]
-            name = key.rsplit("/", 1)[-1]
-            if "_MDM" in name:
-                continue
-            if not (name.startswith(RADAR_ID) and ("_V06" in name or name.endswith(".gz"))):
-                continue
-            candidates.append((obj["LastModified"], key))
-    if not candidates:
-        raise RuntimeError(f"No recent Level-II files found for {RADAR_ID}.")
-    return max(candidates, key=lambda item: item[0])[1]
+    now = datetime.now(timezone.utc)
+
+    for prefix in _candidate_prefixes(now):
+        candidates: list[tuple[datetime, str]] = []
+        paginator = s3.get_paginator("list_objects_v2")
+
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                name = key.rsplit("/", 1)[-1]
+
+                if "_MDM" in name:
+                    continue
+                if not name.startswith(RADAR_ID):
+                    continue
+                if "_V06" not in name and not name.endswith(".gz"):
+                    continue
+
+                candidates.append((obj["LastModified"], key))
+
+        if candidates:
+            latest = max(candidates, key=lambda item: item[0])[1]
+            print(f"[NEXRAD] latest {RADAR_ID}: {latest}", flush=True)
+            return latest
+
+    raise RuntimeError(
+        f"No recent Level-II files found for {RADAR_ID} in the current or previous UTC day."
+    )
 
 
 def _clear_render_cache() -> None:
@@ -132,8 +145,10 @@ def refresh_volume() -> bool:
         load_key(key)
         return True
     except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        print(f"[NEXRAD ERROR] {message}", flush=True)
         with state_lock:
-            state.error = f"{type(exc).__name__}: {exc}"
+            state.error = message
         return False
 
 
