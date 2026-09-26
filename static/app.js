@@ -10,6 +10,12 @@ const state = {
   renderToken: 0,
   lastStatus: null,
   wheelLocked: false,
+  frame: 0,
+  history: [],
+  maxFrame: 0,
+  wallMode: false,
+  boundaries: null,
+  boundariesLoading: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -45,7 +51,9 @@ function fmtUtc(iso) {
 }
 
 function humanAge(seconds) {
-  if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds))) return "age unknown";
+  if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds))) {
+    return "age unknown";
+  }
   const sec = Math.max(0, Math.round(Number(seconds)));
   if (sec < 60) return sec + "s old";
   const min = Math.floor(sec / 60);
@@ -53,44 +61,106 @@ function humanAge(seconds) {
   return min + "m " + rem + "s old";
 }
 
-function currentAgeSeconds() {
-  const iso = state.lastStatus?.volume_time || state.volume?.volume_time;
-  if (!iso) return null;
-  return (Date.now() - new Date(iso).getTime()) / 1000;
+function setLiveBadge(mode, text) {
+  const badge = el("liveBadge");
+  badge.classList.remove("live", "history", "offline");
+  if (mode) badge.classList.add(mode);
+  el("liveText").textContent = text;
+}
+
+function currentFrameMeta() {
+  return state.history.find((item) => item.frame === state.frame) || null;
+}
+
+function updateTimeUI() {
+  const meta = currentFrameMeta();
+  el("timePastBtn").disabled = state.frame >= state.maxFrame;
+  el("timeFutureBtn").disabled = state.frame <= 0;
+  el("goLiveBtn").classList.toggle("active", state.frame === 0);
+
+  if (state.frame === 0) {
+    el("timeLabel").textContent = state.volume?.source === "live" ? "LIVE" : "LATEST";
+  } else {
+    el("timeLabel").textContent = "-" + state.frame + " VOL";
+  }
+
+  el("timeStamp").textContent = fmtUtc(state.volume?.volume_time || meta?.volume_time);
 }
 
 function updateStatus(data) {
   state.lastStatus = data;
   const dot = el("statusDot");
   dot.classList.toggle("ok", !!data.loaded);
-  dot.classList.toggle("bad", !data.loaded && !!data.error);
-  el("statusText").textContent = data.loaded ? "Rapid AWS volume monitor active" : "Waiting for Level-II data";
-  if (data.error) {
-    el("volumeTime").textContent = data.error;
-  } else if (data.loaded) {
+  dot.classList.toggle("bad", !data.loaded || (!!data.error && !data.live_available));
+
+  if (state.frame > 0) {
+    setLiveBadge("history", "HISTORY");
+    el("statusText").textContent = "Historical volume";
     el("volumeTime").textContent =
-      "Volume " + fmtUtc(data.volume_time) + " · " + humanAge(data.age_seconds) +
-      " · checks every " + data.poll_seconds + "s";
-  } else {
-    el("volumeTime").textContent = "Waiting for volume metadata";
+      "Frame -" + state.frame + " · " + fmtUtc(state.volume?.volume_time);
+    updateTimeUI();
+    return;
   }
+
+  if (data.live_available) {
+    setLiveBadge("live", data.live_complete ? "LIVE · COMPLETE" : "LIVE · SCANNING");
+    el("statusText").textContent = "AWS Level-II chunk stream";
+    el("volumeTime").textContent =
+      "Volume " + fmtUtc(data.live_volume_time) +
+      " · " + humanAge(data.live_age_seconds) +
+      " · " + data.live_chunk_count + " chunks";
+  } else if (data.archive_loaded) {
+    setLiveBadge(data.xradar_available ? "history" : "offline", "ARCHIVE");
+    el("statusText").textContent = data.xradar_available
+      ? "Waiting for real-time chunk stream"
+      : "Xradar 0.12+ needed for true live mode";
+    el("volumeTime").textContent =
+      "Latest complete " + fmtUtc(data.archive_volume_time) +
+      " · " + humanAge(data.archive_age_seconds);
+  } else {
+    setLiveBadge("offline", "OFFLINE");
+    el("statusText").textContent = "Waiting for radar data";
+    el("volumeTime").textContent = data.live_error || data.error || "No volume loaded";
+  }
+
+  updateTimeUI();
 }
 
-function refreshAgeLabel() {
-  if (!state.lastStatus?.loaded || state.lastStatus?.error) return;
-  el("volumeTime").textContent =
-    "Volume " + fmtUtc(state.lastStatus.volume_time) + " · " + humanAge(currentAgeSeconds()) +
-    " · checks every " + state.lastStatus.poll_seconds + "s";
+async function loadHistory() {
+  try {
+    const data = await json("/api/history");
+    state.history = data.frames || [];
+    state.maxFrame = Number(data.max_frame || 0);
+    if (state.frame > state.maxFrame) state.frame = state.maxFrame;
+    updateTimeUI();
+  } catch (err) {
+    console.error("History load failed", err);
+  }
 }
 
 async function loadStatus() {
   try {
     const data = await json("/api/status");
+    const previousToken = state.lastStatus?.live_token;
+    const previousArchive = state.lastStatus?.archive_key;
     updateStatus(data);
-    if (data.loaded && (!state.volume || data.key !== state.volume.key)) {
-      await loadVolume();
+
+    if (state.frame === 0) {
+      const liveChanged = data.live_available && data.live_token && data.live_token !== state.volume?.key;
+      const archiveChanged = !data.live_available && data.archive_key && data.archive_key !== state.volume?.key;
+      if (liveChanged || archiveChanged) {
+        await loadHistory();
+        await loadVolume(true);
+      }
+    } else if (data.archive_key && data.archive_key !== previousArchive) {
+      await loadHistory();
+    }
+
+    if (data.live_token !== previousToken && state.wallMode && state.frame === 0) {
+      renderWall();
     }
   } catch (err) {
+    setLiveBadge("offline", "OFFLINE");
     el("statusText").textContent = "Backend unavailable";
     el("volumeTime").textContent = err.message;
     el("statusDot").classList.add("bad");
@@ -109,34 +179,27 @@ function getSweepPosition() {
 function fillControls(volume, priorElevation = null) {
   const currentField = state.field;
   fieldSelect.innerHTML = "";
+
   volume.fields.forEach((f) => {
     const o = document.createElement("option");
     o.value = f.id;
     o.textContent = f.label;
     fieldSelect.appendChild(o);
   });
+
   state.field = volume.fields.some((f) => f.id === currentField)
     ? currentField
-    : volume.fields[0]?.id;
+    : (volume.fields[0]?.id || "reflectivity");
   fieldSelect.value = state.field;
-
-  const elevationCounts = new Map();
-  volume.sweeps.forEach((s) => {
-    const key = s.elevation.toFixed(2);
-    elevationCounts.set(key, (elevationCounts.get(key) || 0) + 1);
-  });
-  const seen = new Map();
 
   sweepSelect.innerHTML = "";
   volume.sweeps.forEach((s) => {
-    const key = s.elevation.toFixed(2);
-    const cut = (seen.get(key) || 0) + 1;
-    seen.set(key, cut);
     const o = document.createElement("option");
     o.value = s.index;
-    o.textContent = elevationCounts.get(key) > 1
-      ? `${s.elevation.toFixed(2)}° · cut ${cut}`
-      : `${s.elevation.toFixed(2)}°`;
+    const progress = Number(s.completion ?? 100);
+    o.textContent = progress < 99.5
+      ? s.elevation.toFixed(2) + "° · " + Math.round(progress) + "%"
+      : s.elevation.toFixed(2) + "°";
     sweepSelect.appendChild(o);
   });
 
@@ -154,14 +217,17 @@ function fillControls(volume, priorElevation = null) {
   } else if (!volume.sweeps.some((s) => s.index === state.sweep)) {
     state.sweep = volume.sweeps[0]?.index || 0;
   }
+
   sweepSelect.value = String(state.sweep);
 }
 
-function imageUrl(sweep = state.sweep) {
+function imageUrl(sweep = state.sweep, size = 640) {
   if (!state.volume) return "";
   const params = new URLSearchParams({
     range_km: String(state.rangeKm),
     smooth: state.smooth ? "true" : "false",
+    frame: String(state.frame),
+    size: String(size),
     v: state.volume.key || "unknown",
   });
   return `/api/image/${encodeURIComponent(state.field)}/${sweep}.png?${params.toString()}`;
@@ -170,12 +236,12 @@ function imageUrl(sweep = state.sweep) {
 function prefetchSweep(sweep) {
   if (!state.volume?.sweeps.some((s) => s.index === sweep)) return;
   const image = new Image();
-  image.src = imageUrl(sweep);
+  image.src = imageUrl(sweep, 640);
 }
 
 function prefetchNeighbors() {
   const pos = getSweepPosition();
-  if (pos < 0) return;
+  if (pos < 0 || state.wallMode) return;
   for (const offset of [-1, 1]) {
     const neighbor = state.volume.sweeps[pos + offset];
     if (neighbor) prefetchSweep(neighbor.index);
@@ -208,9 +274,13 @@ function updateTiltHud() {
   if (!sweep || !state.volume) return;
 
   const pos = getSweepPosition();
+  const completion = Number(sweep.completion ?? 100);
   el("tiltDegree").textContent = sweep.elevation.toFixed(2) + "°";
-  el("tiltPosition").textContent = `Tilt ${pos + 1} of ${state.volume.sweeps.length} · sweep ${sweep.index}`;
-  el("sweepLabel").textContent = `${sweep.elevation.toFixed(2)}° elevation · tilt ${pos + 1}/${state.volume.sweeps.length}`;
+  el("tiltPosition").textContent =
+    `Tilt ${pos + 1} of ${state.volume.sweeps.length}` +
+    (completion < 99.5 ? ` · ${Math.round(completion)}% received` : "");
+  el("sweepLabel").textContent =
+    `${sweep.elevation.toFixed(2)}° elevation · tilt ${pos + 1}/${state.volume.sweeps.length}`;
   el("currentTiltValue").textContent = sweep.elevation.toFixed(2) + "°";
 
   const exactKm = exactSelectedHeightKm();
@@ -222,15 +292,18 @@ function updateTiltHud() {
     el("currentHeightValue").textContent = kft.toFixed(1) + " kft";
   } else if (activeRange !== null) {
     const approxKm = beamHeightArlKm(Number(activeRange), sweep.elevation);
-    el("beamHeightHud").textContent = `Beam center ~${kmToKft(approxKm).toFixed(1)} kft ARL @ ${Number(activeRange).toFixed(1)} km`;
+    el("beamHeightHud").textContent =
+      `Beam center ~${kmToKft(approxKm).toFixed(1)} kft ARL @ ${Number(activeRange).toFixed(1)} km`;
     if (exactKm === null) el("currentHeightValue").textContent = "—";
   } else {
     el("beamHeightHud").textContent = "Move cursor over radar for beam height";
-    el("currentHeightValue").textContent = exactKm === null ? "—" : kmToKft(exactKm).toFixed(1) + " kft";
+    el("currentHeightValue").textContent =
+      exactKm === null ? "—" : kmToKft(exactKm).toFixed(1) + " kft";
   }
 
   if (state.hoverRangeKm !== null && state.hoverAzimuth !== null) {
-    el("cursorHud").textContent = `Az ${state.hoverAzimuth.toFixed(1)}° · Range ${state.hoverRangeKm.toFixed(1)} km`;
+    el("cursorHud").textContent =
+      `Az ${state.hoverAzimuth.toFixed(1)}° · Range ${state.hoverRangeKm.toFixed(1)} km`;
   } else {
     el("cursorHud").textContent = "Wheel ↑ higher tilt · Wheel ↓ lower tilt";
   }
@@ -240,10 +313,56 @@ function updateTiltHud() {
   updateInspectorHighlight();
 }
 
-function renderRadar() {
+function segmentsToPath(segments) {
+  let out = "";
+  for (const segment of segments || []) {
+    if (!segment.length) continue;
+    out += "M" + segment.map((p) => p[0] + "," + (-p[1])).join("L");
+  }
+  return out;
+}
+
+function boundarySvgMarkup() {
+  if (!state.boundaries) return "";
+  const countyPath = segmentsToPath(state.boundaries.counties);
+  const statePath = segmentsToPath(state.boundaries.states);
+  return `<path class="county" d="${countyPath}"></path><path class="state" d="${statePath}"></path>`;
+}
+
+function renderBoundaries() {
+  if (!state.boundaries) return;
+  const r = state.rangeKm;
+  const svg = el("boundaryOverlay");
+  svg.setAttribute("viewBox", `${-r} ${-r} ${2 * r} ${2 * r}`);
+  svg.innerHTML = boundarySvgMarkup();
+
+  document.querySelectorAll(".wall-boundary").forEach((wallSvg) => {
+    wallSvg.setAttribute("viewBox", `${-r} ${-r} ${2 * r} ${2 * r}`);
+    wallSvg.innerHTML = boundarySvgMarkup();
+  });
+}
+
+async function loadBoundaries() {
+  if (state.boundaries || state.boundariesLoading) {
+    renderBoundaries();
+    return;
+  }
+  state.boundariesLoading = true;
+  try {
+    state.boundaries = await json("/api/boundaries?range_km=330");
+    renderBoundaries();
+  } catch (err) {
+    console.warn("Boundary load failed", err);
+    toast("State/county outlines could not be loaded.");
+  } finally {
+    state.boundariesLoading = false;
+  }
+}
+
+function renderSingleRadar() {
   if (!state.volume || !state.field) return;
 
-  const url = imageUrl();
+  const url = imageUrl(state.sweep, 640);
   const token = ++state.renderToken;
   const loader = new Image();
 
@@ -251,11 +370,14 @@ function renderRadar() {
     if (token !== state.renderToken) return;
     radarImage.src = url;
     updateTiltHud();
+    renderBoundaries();
     setTimeout(prefetchNeighbors, 0);
   };
 
   loader.onerror = () => {
-    if (token === state.renderToken) toast("Radar image rendering failed.");
+    if (token === state.renderToken) {
+      toast("This moment is not available on that tilt yet.");
+    }
   };
 
   loader.src = url;
@@ -265,6 +387,93 @@ function renderRadar() {
     ? `${field.label}${field.units ? " · " + field.units : ""}${state.smooth ? " · 2-D interpolated" : ""}`
     : state.field;
   updateTiltHud();
+}
+
+function renderWall() {
+  if (!state.volume || !state.field) return;
+
+  const wall = el("tiltWall");
+  wall.innerHTML = "";
+
+  const tilts = state.volume.sweeps.slice(0, 16);
+  for (let i = 0; i < 16; i++) {
+    const tilt = tilts[i];
+    const tile = document.createElement("div");
+    tile.className = "wall-tile";
+
+    if (!tilt) {
+      tile.classList.add("wall-empty");
+      tile.textContent = "No additional base tilt";
+      wall.appendChild(tile);
+      continue;
+    }
+
+    if (tilt.index === state.sweep) tile.classList.add("active");
+
+    const img = document.createElement("img");
+    img.alt = `${tilt.elevation.toFixed(2)} degree ${state.field}`;
+    img.src = imageUrl(tilt.index, 300);
+
+    const label = document.createElement("div");
+    label.className = "wall-label";
+    label.textContent = tilt.elevation.toFixed(2) + "°";
+
+    const progress = document.createElement("div");
+    const completion = Number(tilt.completion ?? 100);
+    progress.className = "wall-progress" + (completion < 99.5 ? " scanning" : "");
+    progress.textContent = completion < 99.5
+      ? Math.max(1, Math.round(completion)) + "%"
+      : "READY";
+
+    const bsvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    bsvg.setAttribute("class", "wall-boundary");
+    bsvg.setAttribute("aria-hidden", "true");
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("aria-label", "Open " + tilt.elevation.toFixed(2) + " degree tilt");
+    button.addEventListener("click", () => {
+      state.sweep = tilt.index;
+      sweepSelect.value = String(tilt.index);
+      setWallMode(false);
+      renderSingleRadar();
+    });
+
+    img.addEventListener("error", () => {
+      img.style.opacity = "0.18";
+      progress.textContent = "WAIT";
+      progress.classList.add("scanning");
+    });
+
+    tile.append(img, bsvg, label, progress, button);
+    wall.appendChild(tile);
+  }
+
+  const incomplete = state.volume.sweeps.filter((s) => Number(s.completion ?? 100) < 99.5);
+  if (state.frame === 0 && state.volume.source === "live") {
+    el("wallStatus").textContent = incomplete.length
+      ? `${state.volume.sweeps.length} base tilts · receiving ${incomplete[incomplete.length - 1].elevation.toFixed(2)}° now`
+      : `${state.volume.sweeps.length} base tilts · live volume complete`;
+  } else {
+    el("wallStatus").textContent =
+      `${state.volume.sweeps.length} base tilts · ${fmtUtc(state.volume.volume_time)}`;
+  }
+
+  renderBoundaries();
+}
+
+function renderRadar() {
+  if (state.wallMode) renderWall();
+  else renderSingleRadar();
+}
+
+function setWallMode(enabled) {
+  state.wallMode = !!enabled;
+  el("singleView").classList.toggle("hidden", state.wallMode);
+  el("wallView").classList.toggle("hidden", !state.wallMode);
+  el("wallToggleBtn").textContent = state.wallMode ? "Single Panel" : "16 Panel";
+  if (state.wallMode) renderWall();
+  else renderSingleRadar();
 }
 
 function setSweep(sweepIndex) {
@@ -281,36 +490,49 @@ function stepSweep(direction) {
   if (next) setSweep(next.index);
 }
 
-async function loadVolume() {
+async function setFrame(frame) {
+  const nextFrame = Math.max(0, Math.min(state.maxFrame, Number(frame)));
+  if (nextFrame === state.frame && state.volume) return;
+
+  const priorElevation = getSweep()?.elevation ?? null;
+  const selectedX = state.point?.x_km;
+  const selectedY = state.point?.y_km;
+
+  state.frame = nextFrame;
+  state.point = null;
+  el("analysisContent").classList.add("hidden");
+  el("emptyState").classList.remove("hidden");
+  updateTimeUI();
+
+  await loadVolume(false, priorElevation);
+
+  if (selectedX !== undefined && selectedY !== undefined) {
+    await inspectAt(selectedX, selectedY, false);
+  }
+}
+
+async function loadVolume(force = false, priorElevationOverride = null) {
   try {
     const previousSweep = getSweep();
-    const priorElevation = previousSweep?.elevation ?? null;
+    const priorElevation = priorElevationOverride ?? previousSweep?.elevation ?? null;
     const selectedX = state.point?.x_km;
     const selectedY = state.point?.y_km;
     const oldKey = state.volume?.key;
 
-    const volume = await json("/api/volume");
+    const volume = await json("/api/volume?frame=" + state.frame);
     state.volume = volume;
     fillControls(volume, priorElevation);
     renderRadar();
+    updateTimeUI();
 
-    updateStatus({
-      ...(state.lastStatus || {}),
-      loaded: true,
-      key: volume.key,
-      volume_time: volume.volume_time,
-      loaded_at: volume.loaded_at,
-      age_seconds: volume.age_seconds,
-      poll_seconds: state.lastStatus?.poll_seconds ?? 5,
-      error: null,
-    });
-
-    if (oldKey && oldKey !== volume.key) {
-      toast("New KMOB volume loaded.");
+    if (force || oldKey !== volume.key) {
       if (selectedX !== undefined && selectedY !== undefined) {
         await inspectAt(selectedX, selectedY, false);
       }
     }
+
+    loadBoundaries();
+    if (state.lastStatus) updateStatus(state.lastStatus);
   } catch (err) {
     toast("Could not load radar volume.");
     console.error(err);
@@ -331,7 +553,8 @@ function updateInspectorHighlight() {
   if (state.point) {
     const active = state.point.rows?.find((r) => r.sweep === state.sweep);
     if (active) {
-      el("currentHeightValue").textContent = kmToKft(Number(active.height_km)).toFixed(1) + " kft";
+      el("currentHeightValue").textContent =
+        kmToKft(Number(active.height_km)).toFixed(1) + " kft";
     }
   }
 }
@@ -340,7 +563,8 @@ function renderInspector(data) {
   state.point = data;
   el("emptyState").classList.add("hidden");
   el("analysisContent").classList.remove("hidden");
-  el("pointBadge").textContent = `${data.azimuth.toFixed(1)}° / ${data.range_km.toFixed(1)} km`;
+  el("pointBadge").textContent =
+    `${data.azimuth.toFixed(1)}° / ${data.range_km.toFixed(1)} km`;
   el("azValue").textContent = data.azimuth.toFixed(1) + "°";
   el("rangeValue").textContent = data.range_km.toFixed(1) + " km";
 
@@ -377,7 +601,9 @@ function renderInspector(data) {
 
 async function inspectAt(xKm, yKm, showErrors = true) {
   try {
-    const data = await json(`/api/inspect?x_km=${Number(xKm).toFixed(3)}&y_km=${Number(yKm).toFixed(3)}`);
+    const data = await json(
+      `/api/inspect?x_km=${Number(xKm).toFixed(3)}&y_km=${Number(yKm).toFixed(3)}&frame=${state.frame}`
+    );
     renderInspector(data);
   } catch (err) {
     if (showErrors) toast("Column analysis failed at this point.");
@@ -416,7 +642,8 @@ radarStage.addEventListener("mouseleave", () => {
     el("cursorReadout").textContent =
       `Selected: az ${state.point.azimuth.toFixed(1)}° · range ${state.point.range_km.toFixed(1)} km`;
   } else {
-    el("cursorReadout").textContent = "Move over radar for azimuth, range and beam height";
+    el("cursorReadout").textContent =
+      "Move over radar for azimuth, range and beam height";
   }
   updateTiltHud();
 });
@@ -424,7 +651,10 @@ radarStage.addEventListener("mouseleave", () => {
 radarStage.addEventListener("click", (event) => {
   const p = eventCoordinates(event);
   cursorMarker.classList.remove("hidden");
-  cursorMarker.setAttribute("transform", `translate(${p.px * 1000 - 500} ${p.py * 1000 - 500})`);
+  cursorMarker.setAttribute(
+    "transform",
+    `translate(${p.px * 1000 - 500} ${p.py * 1000 - 500})`
+  );
   radarStage.focus({preventScroll: true});
   inspectAt(p.xKm, p.yKm);
 });
@@ -440,17 +670,28 @@ radarStage.addEventListener("wheel", (event) => {
 document.addEventListener("keydown", (event) => {
   const tag = event.target?.tagName?.toLowerCase();
   if (["input", "select", "textarea"].includes(tag)) return;
+
   if (event.key === "ArrowUp") {
     event.preventDefault();
     stepSweep(1);
   } else if (event.key === "ArrowDown") {
     event.preventDefault();
     stepSweep(-1);
+  } else if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    setFrame(state.frame + 1);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    setFrame(state.frame - 1);
   }
 });
 
 el("tiltUpBtn").addEventListener("click", () => stepSweep(1));
 el("tiltDownBtn").addEventListener("click", () => stepSweep(-1));
+el("timePastBtn").addEventListener("click", () => setFrame(state.frame + 1));
+el("timeFutureBtn").addEventListener("click", () => setFrame(state.frame - 1));
+el("goLiveBtn").addEventListener("click", () => setFrame(0));
+el("wallToggleBtn").addEventListener("click", () => setWallMode(!state.wallMode));
 
 fieldSelect.addEventListener("change", () => {
   state.field = fieldSelect.value;
@@ -475,31 +716,35 @@ rangeSelect.addEventListener("change", () => {
   el("emptyState").classList.remove("hidden");
   el("analysisContent").classList.add("hidden");
   el("pointBadge").textContent = "No point selected";
-  el("cursorReadout").textContent = "Move over radar for azimuth, range and beam height";
+  el("cursorReadout").textContent =
+    "Move over radar for azimuth, range and beam height";
+  renderBoundaries();
   renderRadar();
 });
 
 el("refreshBtn").addEventListener("click", async () => {
   const button = el("refreshBtn");
   button.disabled = true;
-  button.textContent = "Checking AWS…";
+  button.textContent = "Checking…";
   try {
     const result = await json("/api/refresh", {method: "POST"});
     updateStatus(result);
-    if (result.changed || !state.volume) await loadVolume();
-    toast(result.changed ? "New KMOB volume loaded." : "Already on newest completed volume.");
+    await loadHistory();
+    await loadVolume(true);
+    toast(result.changed ? "Radar data updated." : "Already current.");
   } catch (err) {
-    toast("AWS refresh failed.");
+    toast("Radar refresh failed.");
   } finally {
     button.disabled = false;
-    button.textContent = "Refresh now";
+    button.textContent = "Refresh";
   }
 });
 
 (async function init() {
   state.smooth = smoothToggle.checked;
+  await loadHistory();
   await loadStatus();
   if (!state.volume) await loadVolume();
-  setInterval(loadStatus, 5000);
-  setInterval(refreshAgeLabel, 1000);
+  loadBoundaries();
+  setInterval(loadStatus, 2000);
 })();
