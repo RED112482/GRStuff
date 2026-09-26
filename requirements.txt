@@ -4,3 +4,4 @@ boto3>=1.40,<2
 arm_pyart>=2.3,<2.4
 matplotlib>=3.10,<4
 numpy>=2,<3
+xradar>=0.12,<0.13
