@@ -1040,49 +1040,301 @@ def _circular_diff(a: np.ndarray, b: float) -> np.ndarray:
     return np.abs((a - b + 180.0) % 360.0 - 180.0)
 
 
-@app.get("/api/inspect")
-def api_inspect(
-    x_km: float = Query(..., ge=-460, le=460),
-    y_km: float = Query(..., ge=-460, le=460),
-) -> dict[str, Any]:
-    radar = get_radar()
+def _beam_height_km(range_km: float, elevation_deg: float) -> float:
+    effective_earth_radius_km = 6371.0 * 4.0 / 3.0
+    theta = math.radians(elevation_deg)
+    slant_km = range_km / max(math.cos(theta), 0.02)
+    return math.sqrt(
+        slant_km * slant_km
+        + effective_earth_radius_km * effective_earth_radius_km
+        + 2.0 * slant_km * effective_earth_radius_km * math.sin(theta)
+    ) - effective_earth_radius_km
+
+
+def _sample_polar(
+    data: np.ndarray,
+    azimuths: np.ndarray,
+    ranges_km: np.ndarray,
+    target_az: float,
+    target_range_km: float,
+) -> float | None:
+    if data.size == 0:
+        return None
+
+    ray = int(np.argmin(_circular_diff(np.asarray(azimuths, dtype=float), target_az)))
+    gate = int(np.argmin(np.abs(np.asarray(ranges_km, dtype=float) - target_range_km)))
+    value = data[ray, gate]
+
+    if not np.isfinite(value):
+        return None
+    return round(float(value), 3)
+
+
+def _live_inspect(x_km: float, y_km: float) -> dict[str, Any]:
     target_range_km = math.hypot(x_km, y_km)
     target_az = (math.degrees(math.atan2(x_km, y_km)) + 360.0) % 360.0
-    ranges_km = np.asarray(radar.range["data"], dtype=float) / 1000.0
-    gate_index = int(np.argmin(np.abs(ranges_km - target_range_km)))
+    tilts = _live_base_tilts()
     rows = []
 
-    for sweep in range(radar.nsweeps):
-        sweep_slice = radar.get_slice(sweep)
-        azimuths = np.asarray(radar.azimuth["data"][sweep_slice], dtype=float)
-        local_ray = int(np.argmin(_circular_diff(azimuths, target_az)))
-        global_ray = int(radar.sweep_start_ray_index["data"][sweep]) + local_ray
-        _, _, z = radar.get_gate_x_y_z(sweep)
-
+    for tilt in tilts:
         values: dict[str, float | None] = {}
+        actual_range = target_range_km
+        actual_az = target_az
+
         for field in FIELD_CONFIG:
-            if field not in radar.fields:
+            try:
+                data, azimuths, ranges_km, _ = _live_tilt_arrays(field, tilt["index"])
+            except HTTPException:
                 continue
-            arr = radar.fields[field]["data"]
-            val = arr[global_ray, gate_index]
-            values[field] = None if np.ma.is_masked(val) else round(float(val), 3)
+            values[field] = _sample_polar(
+                data,
+                azimuths,
+                ranges_km,
+                target_az,
+                target_range_km,
+            )
+            if len(ranges_km):
+                actual_range = float(
+                    ranges_km[int(np.argmin(np.abs(ranges_km - target_range_km)))]
+                )
+            if len(azimuths):
+                actual_az = float(
+                    azimuths[int(np.argmin(_circular_diff(azimuths, target_az)))]
+                )
 
         rows.append({
-            "sweep": sweep,
-            "elevation": round(float(radar.fixed_angle["data"][sweep]), 2),
-            "height_km": round(float(z[local_ray, gate_index]) / 1000.0, 3),
-            "azimuth": round(float(azimuths[local_ray]), 2),
-            "range_km": round(float(ranges_km[gate_index]), 2),
+            "sweep": tilt["index"],
+            "elevation": round(float(tilt["elevation"]), 2),
+            "height_km": round(_beam_height_km(actual_range, tilt["elevation"]), 3),
+            "azimuth": round(actual_az, 2),
+            "range_km": round(actual_range, 2),
+            "completion": round(_live_tilt_completion(tilt), 1),
             "values": values,
         })
 
     return {
+        "source": "live",
         "x_km": round(x_km, 2),
         "y_km": round(y_km, 2),
         "azimuth": round(target_az, 2),
         "range_km": round(target_range_km, 2),
         "rows": rows,
     }
+
+
+def _archive_inspect(radar, x_km: float, y_km: float) -> dict[str, Any]:
+    target_range_km = math.hypot(x_km, y_km)
+    target_az = (math.degrees(math.atan2(x_km, y_km)) + 360.0) % 360.0
+    ranges_km = np.asarray(radar.range["data"], dtype=float) / 1000.0
+    gate_index = int(np.argmin(np.abs(ranges_km - target_range_km)))
+    tilts = _archive_base_tilts(radar)
+    rows = []
+
+    for tilt in tilts:
+        height_raw = int(tilt["raw"][0])
+        height_slice = radar.get_slice(height_raw)
+        height_az = np.asarray(radar.azimuth["data"][height_slice], dtype=float)
+        height_local_ray = int(np.argmin(_circular_diff(height_az, target_az)))
+        _, _, z = radar.get_gate_x_y_z(height_raw)
+        height_km = float(z[height_local_ray, gate_index]) / 1000.0
+
+        values: dict[str, float | None] = {}
+        actual_az = target_az
+
+        for field in FIELD_CONFIG:
+            if field not in radar.fields:
+                continue
+
+            raw_sweep = _archive_raw_sweep_for_field(radar, tilt, field)
+            sweep_slice = radar.get_slice(raw_sweep)
+            azimuths = np.asarray(radar.azimuth["data"][sweep_slice], dtype=float)
+            local_ray = int(np.argmin(_circular_diff(azimuths, target_az)))
+            global_ray = int(radar.sweep_start_ray_index["data"][raw_sweep]) + local_ray
+            val = radar.fields[field]["data"][global_ray, gate_index]
+            values[field] = None if np.ma.is_masked(val) else round(float(val), 3)
+            actual_az = float(azimuths[local_ray])
+
+        rows.append({
+            "sweep": tilt["index"],
+            "elevation": round(float(tilt["elevation"]), 2),
+            "height_km": round(height_km, 3),
+            "azimuth": round(actual_az, 2),
+            "range_km": round(float(ranges_km[gate_index]), 2),
+            "completion": 100.0,
+            "values": values,
+        })
+
+    return {
+        "source": "archive",
+        "x_km": round(x_km, 2),
+        "y_km": round(y_km, 2),
+        "azimuth": round(target_az, 2),
+        "range_km": round(target_range_km, 2),
+        "rows": rows,
+    }
+
+
+@app.get("/api/inspect")
+def api_inspect(
+    x_km: float = Query(..., ge=-460, le=460),
+    y_km: float = Query(..., ge=-460, le=460),
+    frame: int = Query(0, ge=0, le=HISTORY_FRAMES),
+) -> dict[str, Any]:
+    if frame == 0:
+        with live_lock:
+            has_live = live_tree is not None
+        if has_live:
+            result = _live_inspect(x_km, y_km)
+            result["frame"] = 0
+            return result
+
+    radar, _ = _archive_frame(frame)
+    result = _archive_inspect(radar, x_km, y_km)
+    result["frame"] = frame
+    return result
+
+
+BOUNDARY_URLS = {
+    "state": "https://www2.census.gov/geo/tiger/GENZ2025/shp/cb_2025_us_state_5m.zip",
+    "county": "https://www2.census.gov/geo/tiger/GENZ2025/shp/cb_2025_us_county_5m.zip",
+}
+
+
+def _boundary_shapefile(layer: str) -> Path:
+    if layer not in BOUNDARY_URLS:
+        raise ValueError(f"Unknown boundary layer: {layer}")
+    if not CARTOPY_AVAILABLE:
+        raise RuntimeError("Cartopy is not available.")
+
+    layer_dir = BOUNDARY_DIR / layer
+    layer_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(layer_dir.glob("*.shp"))
+    if existing:
+        return existing[0]
+
+    zip_path = BOUNDARY_DIR / f"{layer}.zip"
+    if not zip_path.exists():
+        print(f"[BOUNDARIES] downloading Census {layer} outlines", flush=True)
+        urllib.request.urlretrieve(BOUNDARY_URLS[layer], zip_path)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(layer_dir)
+
+    shapefiles = list(layer_dir.glob("*.shp"))
+    if not shapefiles:
+        raise RuntimeError(f"Census {layer} shapefile did not extract correctly.")
+    return shapefiles[0]
+
+
+def _iter_geometry_lines(geometry):
+    geom_type = getattr(geometry, "geom_type", "")
+
+    if geom_type == "Polygon":
+        yield list(geometry.exterior.coords)
+    elif geom_type == "MultiPolygon":
+        for polygon in geometry.geoms:
+            yield list(polygon.exterior.coords)
+    elif geom_type == "LineString":
+        yield list(geometry.coords)
+    elif geom_type == "MultiLineString":
+        for line in geometry.geoms:
+            yield list(line.coords)
+
+
+def _project_boundary_layer(
+    layer: str,
+    radar_lat: float,
+    radar_lon: float,
+    max_range_km: float,
+) -> list[list[list[float]]]:
+    cache_key = f"{layer}:{radar_lat:.3f}:{radar_lon:.3f}:{max_range_km:.0f}"
+
+    with boundary_lock:
+        cached = boundary_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    shp = _boundary_shapefile(layer)
+    reader = shapereader.Reader(str(shp))
+
+    degree_pad = max_range_km / 85.0 + 1.0
+    lon_min = radar_lon - degree_pad
+    lon_max = radar_lon + degree_pad
+    lat_min = radar_lat - degree_pad
+    lat_max = radar_lat + degree_pad
+
+    segments: list[list[list[float]]] = []
+
+    for geometry in reader.geometries():
+        gx0, gy0, gx1, gy1 = geometry.bounds
+        if gx1 < lon_min or gx0 > lon_max or gy1 < lat_min or gy0 > lat_max:
+            continue
+
+        for coords in _iter_geometry_lines(geometry):
+            if len(coords) < 2:
+                continue
+
+            lon = np.asarray([point[0] for point in coords], dtype=float)
+            lat = np.asarray([point[1] for point in coords], dtype=float)
+            x, y = pyart.core.geographic_to_cartesian_aeqd(
+                lon,
+                lat,
+                radar_lon,
+                radar_lat,
+            )
+            x = np.asarray(x, dtype=float) / 1000.0
+            y = np.asarray(y, dtype=float) / 1000.0
+
+            keep = (
+                (x >= -max_range_km * 1.15)
+                & (x <= max_range_km * 1.15)
+                & (y >= -max_range_km * 1.15)
+                & (y <= max_range_km * 1.15)
+            )
+            if not np.any(keep):
+                continue
+
+            step = max(1, int(len(x) / 500))
+            segment = [
+                [round(float(px), 2), round(float(py), 2)]
+                for px, py in zip(x[::step], y[::step])
+            ]
+            if len(segment) >= 2:
+                segments.append(segment)
+
+    with boundary_lock:
+        boundary_cache[cache_key] = segments
+    return segments
+
+
+@app.get("/api/boundaries")
+def api_boundaries(
+    range_km: float = Query(320.0, ge=50, le=500),
+) -> dict[str, Any]:
+    try:
+        if live_tree is not None:
+            radar_lat, radar_lon, _ = _live_root_values()
+        else:
+            radar = get_radar()
+            radar_lat = float(radar.latitude["data"][0])
+            radar_lon = float(radar.longitude["data"][0])
+
+        states = _project_boundary_layer("state", radar_lat, radar_lon, range_km)
+        counties = _project_boundary_layer("county", radar_lat, radar_lon, range_km)
+
+        return {
+            "radar_lat": radar_lat,
+            "radar_lon": radar_lon,
+            "range_km": range_km,
+            "states": states,
+            "counties": counties,
+        }
+    except Exception as exc:
+        print(f"[BOUNDARY ERROR] {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Boundary data unavailable: {exc}",
+        )
 
 
 static_dir = Path(__file__).resolve().parent / "static"
