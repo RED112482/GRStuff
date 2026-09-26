@@ -23,6 +23,7 @@ The browser prototype proved the Level-II ingest and scan-history concepts, but 
 - Any viewport change is synchronized across all panes.
 - After zoom/pan settles, raw polar Level-II data is re-interpolated into the visible viewport rather than merely scaling an old PNG.
 - No FastAPI, browser, PNG encoding, or HTTP requests in the display path.
+- State and county outlines are drawn natively from cached Census cartographic-boundary shapefiles.
 
 ## Install on Windows
 
