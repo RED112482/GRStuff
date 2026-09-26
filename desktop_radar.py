@@ -626,32 +626,43 @@ class RadarDataWorker(QtCore.QThread):
                     break
                 self.msleep(100)
 
-    def _candidate_archive_prefixes(self) -> list[str]:
-        now = datetime.now(timezone.utc)
-        return [
-            f"{now:%Y/%m/%d}/{RADAR_ID}/",
-            f"{(now - timedelta(days=1)):%Y/%m/%d}/{RADAR_ID}/",
-        ]
-
     def _recent_archive_keys(self) -> list[str]:
-        found: list[tuple[datetime, str]] = []
-        for prefix in self._candidate_archive_prefixes():
-            paginator = self.archive_s3.get_paginator("list_objects_v2")
-            for page in paginator.paginate(
+        """Find recent completed volumes without scanning a full radar day."""
+        now = datetime.now(timezone.utc)
+        found: dict[str, datetime] = {}
+
+        # Completed Level-II filenames begin with KMOBYYYYMMDD_HH, so querying
+        # only the last few UTC hours keeps startup listings tiny.
+        for hours_back in range(0, 5):
+            stamp = now - timedelta(hours=hours_back)
+            prefix = (
+                f"{stamp:%Y/%m/%d}/{RADAR_ID}/"
+                f"{RADAR_ID}{stamp:%Y%m%d_%H}"
+            )
+            response = self.archive_s3.list_objects_v2(
                 Bucket=ARCHIVE_BUCKET,
                 Prefix=prefix,
-            ):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    name = key.rsplit("/", 1)[-1]
-                    if "_MDM" in name or not name.startswith(RADAR_ID):
-                        continue
-                    if "_V06" not in name and not name.endswith(".gz"):
-                        continue
-                    found.append((obj["LastModified"], key))
+                MaxKeys=1000,
+            )
+            for obj in response.get("Contents", []):
+                key = obj["Key"]
+                name = key.rsplit("/", 1)[-1]
+                if "_MDM" in name:
+                    continue
+                if "_V06" not in name and not name.endswith(".gz"):
+                    continue
+                found[key] = obj["LastModified"]
 
-        found.sort(reverse=True)
-        return [key for _, key in found[:ARCHIVE_VOLUMES]]
+            if len(found) >= ARCHIVE_VOLUMES:
+                break
+
+        ordered = sorted(
+            found.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        return [key for key, _ in ordered[:ARCHIVE_VOLUMES]]
+
 
     def _recent_tgftp_files(self) -> list[str]:
         url = f"{TGFTP_BASE}/{RADAR_ID}/dir.list"
@@ -736,19 +747,26 @@ class RadarDataWorker(QtCore.QThread):
     def _bootstrap_archive(self):
         loaded_any = False
 
-        # Prefer the NWS direct directory for recent completed-volume history.
-        # For visualization, pad an incomplete final sweep rather than dropping
-        # the entire file's only available sweep.
+        # Primary startup/history source: completed AWS Level-II volumes.
+        # Hour-scoped listing above makes this fast while avoiding partially
+        # written tgftp files.
         try:
-            names = self._recent_tgftp_files()
-            for idx, name in enumerate(names):
+            keys = self._recent_archive_keys()
+            for idx, key in enumerate(reversed(keys)):
                 if not self._running:
                     return
 
-                self.status.emit(
-                    f"Loading NWS Level-II history {idx + 1}/{len(names)}…"
-                )
-                path = self._download_tgftp_file(name)
+                path = self._archive_path(key)
+                if not path.exists():
+                    self.status.emit(
+                        f"Downloading completed Level-II "
+                        f"{idx + 1}/{len(keys)}…"
+                    )
+                    self.archive_s3.download_file(
+                        ARCHIVE_BUCKET,
+                        key,
+                        str(path),
+                    )
 
                 try:
                     tree = xd.io.open_nexradlevel2_datatree(
@@ -757,18 +775,14 @@ class RadarDataWorker(QtCore.QThread):
                     )
                 except Exception as exc:
                     print(
-                        f"[NWS HISTORY SKIP] {name}: "
+                        f"[AWS HISTORY SKIP] {key}: "
                         f"{type(exc).__name__}: {exc}",
                         flush=True,
                     )
                     continue
 
-                scans = _extract_scans(tree, name, "archive")
+                scans = _extract_scans(tree, key, "archive")
                 if not scans:
-                    print(
-                        f"[NWS HISTORY SKIP] {name}: no usable sweeps",
-                        flush=True,
-                    )
                     continue
 
                 if self.site_lat is None or self.site_lon is None:
@@ -783,30 +797,25 @@ class RadarDataWorker(QtCore.QThread):
                 loaded_any = True
 
         except Exception as exc:
-            self.status.emit(
-                f"NWS direct history unavailable · using AWS archive "
-                f"({type(exc).__name__}: {exc})"
+            print(
+                f"[AWS HISTORY ERROR] {type(exc).__name__}: {exc}",
+                flush=True,
             )
 
+        # Secondary fallback only. tgftp is useful, but its newest file can be
+        # observed while still growing, so do not make it the startup gate.
         if not loaded_any:
-            keys = self._recent_archive_keys()
-            if keys:
-                for idx, key in enumerate(reversed(keys)):
+            try:
+                names = self._recent_tgftp_files()
+                for idx, name in enumerate(names):
                     if not self._running:
                         return
 
-                    path = self._archive_path(key)
-                    if not path.exists():
-                        self.status.emit(
-                            f"Downloading AWS archive volume "
-                            f"{idx + 1}/{len(keys)}…"
-                        )
-                        self.archive_s3.download_file(
-                            ARCHIVE_BUCKET,
-                            key,
-                            str(path),
-                        )
-
+                    self.status.emit(
+                        f"Loading NWS fallback history "
+                        f"{idx + 1}/{len(names)}…"
+                    )
+                    path = self._download_tgftp_file(name)
                     try:
                         tree = xd.io.open_nexradlevel2_datatree(
                             str(path),
@@ -814,13 +823,13 @@ class RadarDataWorker(QtCore.QThread):
                         )
                     except Exception as exc:
                         print(
-                            f"[AWS HISTORY SKIP] {key}: "
+                            f"[NWS HISTORY SKIP] {name}: "
                             f"{type(exc).__name__}: {exc}",
                             flush=True,
                         )
                         continue
 
-                    scans = _extract_scans(tree, key, "archive")
+                    scans = _extract_scans(tree, name, "archive")
                     if not scans:
                         continue
 
@@ -834,6 +843,11 @@ class RadarDataWorker(QtCore.QThread):
                     self.expected_sequence = list(scans)
                     self.strategy = _scan_strategy(tree)
                     loaded_any = True
+            except Exception as exc:
+                print(
+                    f"[NWS HISTORY ERROR] {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
         if loaded_any:
             total_scans = sum(len(items) for items in self.histories.values())
@@ -880,7 +894,7 @@ class RadarDataWorker(QtCore.QThread):
             )
 
 
-    def _latest_chunk_prefix(self) -> str | None:
+    def _chunk_prefixes(self, limit: int = 5) -> list[str]:
         root = f"{RADAR_ID}/"
         response = self.chunk_s3.list_objects_v2(
             Bucket=CHUNK_BUCKET,
@@ -889,17 +903,16 @@ class RadarDataWorker(QtCore.QThread):
             MaxKeys=1000,
         )
         prefixes = [item["Prefix"] for item in response.get("CommonPrefixes", [])]
-        if not prefixes:
-            return None
 
         def prefix_key(prefix: str):
             leaf = prefix.rstrip("/").rsplit("/", 1)[-1]
             try:
-                return int(leaf), prefix
+                return int(leaf)
             except ValueError:
-                return -1, prefix
+                return -1
 
-        return max(prefixes, key=prefix_key)
+        prefixes.sort(key=prefix_key, reverse=True)
+        return prefixes[:limit]
 
     def _chunk_objects(self, prefix: str) -> list[dict[str, Any]]:
         response = self.chunk_s3.list_objects_v2(
@@ -962,19 +975,29 @@ class RadarDataWorker(QtCore.QThread):
         return candidates
 
     def _refresh_live(self) -> bool:
-        prefix = self._latest_chunk_prefix()
-        if not prefix:
+        prefixes = self._chunk_prefixes(limit=5)
+        if not prefixes:
             return False
 
-        objects = self._chunk_objects(prefix)
-        candidates = self._chunk_volume_candidates(objects)
-        if not candidates:
+        all_candidates: list[
+            tuple[str, str, list[dict[str, Any]]]
+        ] = []
+        for prefix in prefixes:
+            try:
+                objects = self._chunk_objects(prefix)
+            except Exception:
+                continue
+            for volume_id, volume_objects in self._chunk_volume_candidates(objects):
+                all_candidates.append((volume_id, prefix, volume_objects))
+
+        if not all_candidates:
             self.status.emit("LIVE · waiting for a volume-start S chunk…")
             return False
 
-        # Try newest usable volume first.  If it only has its S chunk and no
-        # sweep yet, keep the currently displayed volume until more arrives.
-        for volume_id, volume_objects in candidates[:3]:
+        # A valid volume timestamp is sortable as text (YYYYMMDD-HHMMSS).
+        all_candidates.sort(key=lambda item: item[0], reverse=True)
+
+        for volume_id, prefix, volume_objects in all_candidates[:6]:
             is_current = volume_id == self.current_live_volume
             chunk_cache = self._chunk_bytes if is_current else {}
             changed = not is_current
@@ -990,15 +1013,12 @@ class RadarDataWorker(QtCore.QThread):
                 changed = True
 
             ordered = [
-                obj
-                for obj in volume_objects
+                obj for obj in volume_objects
                 if obj["Key"] in chunk_cache
             ]
             if not ordered:
                 continue
 
-            # Defense in depth: the selected first object must actually carry
-            # the Archive-II volume header, not merely have an S filename.
             first_bytes = chunk_cache[ordered[0]["Key"]]
             if not first_bytes[:4].startswith(b"AR2V"):
                 continue
@@ -1012,13 +1032,13 @@ class RadarDataWorker(QtCore.QThread):
                     chunks,
                     incomplete_sweep="pad",
                 )
-            except ValueError:
+            except (ValueError, EOFError, OSError):
                 continue
 
             scans = _extract_scans(tree, volume_id, "live")
             if not scans:
-                # New volume exists but no usable sweep yet.  Keep prior
-                # imagery rather than blanking/failing the live display.
+                # Keep completed/archive display until the new live volume has
+                # enough bytes to expose its first partial sweep.
                 continue
 
             self.current_live_volume = volume_id
@@ -1042,6 +1062,9 @@ class RadarDataWorker(QtCore.QThread):
             )
             return True
 
+        self.status.emit(
+            "LIVE · no decodable S→I/E volume yet · showing completed data"
+        )
         return False
 
     def _merge_scans(self, scans: list[RadarScan]):
