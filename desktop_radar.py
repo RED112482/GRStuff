@@ -297,6 +297,26 @@ def _boundary_xy(
     )
 
 
+def _scan_strategy(tree) -> dict[str, Any]:
+    try:
+        root = tree["/"].to_dataset()
+        attrs = root.attrs
+    except Exception:
+        return {
+            "scan_name": "VCP ?",
+            "dynamic_scan_type": "unknown",
+            "number_elevation_cuts": 0,
+            "vcp_sequence_active": False,
+        }
+
+    return {
+        "scan_name": str(attrs.get("scan_name", "VCP ?")),
+        "dynamic_scan_type": str(attrs.get("dynamic_scan_type", "standard")),
+        "number_elevation_cuts": int(attrs.get("number_elevation_cuts", 0) or 0),
+        "vcp_sequence_active": bool(attrs.get("vcp_sequence_active", False)),
+    }
+
+
 def _canonical_elevation(existing: list[float], value: float) -> float:
     for current in existing:
         if abs(current - value) <= 0.07:
@@ -450,6 +470,14 @@ class RadarDataWorker(QtCore.QThread):
         self.histories: dict[float, list[RadarScan]] = defaultdict(list)
         self.current_live_volume: str | None = None
         self.live_sequence: list[RadarScan] = []
+        self.expected_sequence: list[RadarScan] = []
+        self.strategy: dict[str, Any] = {
+            "scan_name": "VCP ?",
+            "dynamic_scan_type": "unknown",
+            "number_elevation_cuts": 0,
+            "vcp_sequence_active": False,
+        }
+        self.live_complete = False
         self.site_lat: float | None = None
         self.site_lon: float | None = None
         self._boundaries_loaded = False
@@ -555,6 +583,10 @@ class RadarDataWorker(QtCore.QThread):
                 self.site_lat, self.site_lon = _tree_site_location(tree)
             scans = _extract_scans(tree, key, "archive")
             self._merge_scans(scans)
+            # The loop runs oldest -> newest, so these end as the most recent
+            # completed-volume template and scan-strategy metadata.
+            self.expected_sequence = list(scans)
+            self.strategy = _scan_strategy(tree)
 
         self.status.emit("Archive ready · connecting live chunks…")
         self._emit_snapshot()
@@ -636,6 +668,7 @@ class RadarDataWorker(QtCore.QThread):
             self.current_live_volume = prefix
             self._chunk_bytes = {}
             self.live_sequence = []
+            self.live_complete = False
             self.status.emit(f"LIVE · new volume {prefix.rstrip('/').rsplit('/', 1)[-1]}")
 
         objects = self._chunk_objects(prefix)
@@ -664,6 +697,13 @@ class RadarDataWorker(QtCore.QThread):
         )
         scans = _extract_scans(tree, prefix, "live")
         self.live_sequence = scans
+        live_strategy = _scan_strategy(tree)
+        if live_strategy.get("scan_name") != "VCP ?":
+            self.strategy = live_strategy
+        self.live_complete = any(
+            re.search(r"-\d+-E$", obj["Key"].rsplit("/", 1)[-1])
+            for obj in objects
+        )
         self._merge_scans(scans)
 
         last = scans[-1] if scans else None
@@ -698,11 +738,22 @@ class RadarDataWorker(QtCore.QThread):
             key: list(value)
             for key, value in self.histories.items()
         }
+
+        scanning_scan = None
+        if not self.live_complete:
+            if self.live_sequence and self.live_sequence[-1].completion < 98.0:
+                scanning_scan = self.live_sequence[-1]
+            elif len(self.live_sequence) < len(self.expected_sequence):
+                scanning_scan = self.expected_sequence[len(self.live_sequence)]
+
         self.snapshot.emit(
             {
                 "histories": copied,
                 "live_sequence": list(self.live_sequence),
                 "live_volume": self.current_live_volume,
+                "strategy": dict(self.strategy),
+                "scanning_scan": scanning_scan,
+                "live_complete": self.live_complete,
             }
         )
 
@@ -726,6 +777,13 @@ class RadarViewBox(pg.ViewBox):
             minYRange=1.0,
         )
 
+    def set_interaction_mode(self, mode: str):
+        if mode == "zoom":
+            self.setMouseMode(pg.ViewBox.RectMode)
+        else:
+            self.setMouseMode(pg.ViewBox.PanMode)
+
+
     def mouseClickEvent(self, ev):
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:
             self.activated.emit()
@@ -747,7 +805,10 @@ class RadarCanvas(QtWidgets.QWidget):
         super().__init__()
         self.compact = compact
         self.scan: RadarScan | None = None
+        self.is_latest = False
+        self.is_scanning = False
         self._rerendering = False
+        self._last_render_signature: tuple[Any, ...] | None = None
 
         self.view_box = RadarViewBox()
         self.plot = pg.PlotWidget(viewBox=self.view_box)
@@ -838,23 +899,74 @@ class RadarCanvas(QtWidgets.QWidget):
             )
 
 
-    def set_scan(self, scan: RadarScan | None, current_live_volume: str | None):
+    def set_scan(
+        self,
+        scan: RadarScan | None,
+        current_live_volume: str | None,
+        is_latest: bool = False,
+        is_scanning: bool = False,
+    ):
+        prior_id = self.scan.scan_id if self.scan is not None else None
         self.scan = scan
+        self.is_latest = bool(is_latest)
+        self.is_scanning = bool(is_scanning)
+
         if scan is None:
             self.title.setText("—")
             self.badge.setText("NO SCAN")
             self.image.clear()
+            self._last_render_signature = None
             return
 
-        self.title.setText(f"{scan.elevation:.2f}°")
-        if scan.source == "live" and scan.volume_id == current_live_volume:
-            if scan.kind == "BASE":
-                age = "LIVE"
-            else:
-                age = f"{scan.kind} #{scan.sequence_number}"
+        self.title.setText(
+            f"{scan.elevation:.2f}°"
+            + (f" · {scan.kind} #{scan.sequence_number}" if scan.kind != "BASE" else "")
+        )
+        if prior_id != scan.scan_id:
+            self._last_render_signature = None
+        self.update_age_badge(current_live_volume)
+
+    def update_age_badge(self, current_live_volume: str | None):
+        scan = self.scan
+        if scan is None:
+            return
+
+        age_seconds = max(
+            0,
+            int((datetime.now(timezone.utc) - scan.scan_time).total_seconds()),
+        )
+        if age_seconds < 60:
+            age_text = f"{age_seconds}s"
+        elif age_seconds < 3600:
+            age_text = f"{age_seconds // 60}m {age_seconds % 60:02d}s"
         else:
-            age = scan.scan_time.strftime("%H:%M:%SZ")
-        self.badge.setText(age)
+            age_text = f"{age_seconds // 3600}h {(age_seconds % 3600) // 60:02d}m"
+
+        if self.is_scanning:
+            dot = "<span style='color:#ffb547'>●</span>"
+            status = "SCANNING…"
+            color = "#ffcb7a"
+        elif self.is_latest:
+            dot = "<span style='color:#35d07f'>●</span>"
+            status = "LATEST"
+            color = "#bff7d5"
+        else:
+            dot = "<span style='color:#ff5b69'>●</span>"
+            status = "OLDER"
+            color = "#ff9ca5"
+
+        live_suffix = ""
+        if scan.source == "live" and scan.volume_id == current_live_volume:
+            live_suffix = " · LIVE"
+
+        self.badge.setText(
+            f"{dot} <span style='color:{color}'>{status}</span>"
+            f" · {age_text}{live_suffix}"
+        )
+
+    def set_interaction_mode(self, mode: str):
+        self.view_box.set_interaction_mode(mode)
+
 
     def set_active(self, active: bool):
         self.setStyleSheet(
@@ -893,11 +1005,23 @@ class RadarCanvas(QtWidgets.QWidget):
         x_range, y_range = self.visible_ranges()
         size = self.plot.viewport().size()
         if self.compact:
-            width = max(150, min(size.width(), 320))
-            height = max(150, min(size.height(), 320))
+            width = max(140, min(size.width(), 200))
+            height = max(140, min(size.height(), 200))
         else:
             width = max(350, min(size.width(), 1000))
             height = max(350, min(size.height(), 1000))
+
+        signature = (
+            self.scan.scan_id,
+            round(float(x_range[0]), 3),
+            round(float(x_range[1]), 3),
+            round(float(y_range[0]), 3),
+            round(float(y_range[1]), 3),
+            int(width),
+            int(height),
+        )
+        if signature == self._last_render_signature:
+            return
 
         image = render_scan(
             self.scan,
@@ -918,6 +1042,7 @@ class RadarCanvas(QtWidgets.QWidget):
             levels=(-10, 80),
         )
         self.image.setRect(rect)
+        self._last_render_signature = signature
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -929,6 +1054,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.histories: dict[float, list[RadarScan]] = {}
         self.live_sequence: list[RadarScan] = []
         self.live_volume: str | None = None
+        self.strategy: dict[str, Any] = {
+            "scan_name": "VCP ?",
+            "dynamic_scan_type": "unknown",
+        }
+        self.scanning_scan: RadarScan | None = None
+        self.live_complete = False
+        self.interaction_mode = "pan"
         self.boundary_data: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
 
         self.anchor_elevation: float | None = None
@@ -945,6 +1077,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.render_timer.setSingleShot(True)
         self.render_timer.setInterval(100)
         self.render_timer.timeout.connect(self._rerender_visible)
+
+        self.age_timer = QtCore.QTimer(self)
+        self.age_timer.setInterval(1000)
+        self.age_timer.timeout.connect(self._refresh_age_labels)
+        self.age_timer.start()
 
         self._build_ui()
 
@@ -974,12 +1111,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.past_btn = QtWidgets.QPushButton("◀ Past")
         self.future_btn = QtWidgets.QPushButton("Future ▶")
         self.live_btn = QtWidgets.QPushButton("LIVE")
+        self.pan_btn = QtWidgets.QPushButton("Pan")
+        self.zoom_btn = QtWidgets.QPushButton("Zoom Box")
+        self.pan_btn.setCheckable(True)
+        self.zoom_btn.setCheckable(True)
+        self.pan_btn.setChecked(True)
+        self.mode_group = QtWidgets.QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addButton(self.pan_btn)
+        self.mode_group.addButton(self.zoom_btn)
         self.wall_btn = QtWidgets.QPushButton("16 Panel")
         self.reset_btn = QtWidgets.QPushButton("Reset View")
 
         self.elev_combo = QtWidgets.QComboBox()
         self.time_label = QtWidgets.QLabel("—")
         self.time_label.setMinimumWidth(180)
+        self.strategy_label = QtWidgets.QLabel("VCP ?")
+        self.strategy_label.setStyleSheet(
+            "color:#d8e2ef; font-weight:700; padding:5px;"
+        )
+        self.prediction_label = QtWidgets.QLabel("")
+        self.prediction_label.setStyleSheet(
+            "color:#ffb547; font-weight:700; padding:5px;"
+        )
         self.time_label.setStyleSheet(
             "color: white; font-weight: 700; padding: 5px;"
         )
@@ -994,11 +1148,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_label,
             self.future_btn,
             self.live_btn,
+            self.pan_btn,
+            self.zoom_btn,
             self.wall_btn,
             self.reset_btn,
         ):
             toolbar.addWidget(widget)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.strategy_label)
+        toolbar.addWidget(self.prediction_label)
         main.addLayout(toolbar)
 
         self.stack = QtWidgets.QStackedWidget()
@@ -1031,6 +1189,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.past_btn.clicked.connect(lambda: self._step_time(1))
         self.future_btn.clicked.connect(lambda: self._step_time(-1))
         self.live_btn.clicked.connect(self._go_live)
+        self.pan_btn.clicked.connect(lambda: self._set_interaction_mode("pan"))
+        self.zoom_btn.clicked.connect(lambda: self._set_interaction_mode("zoom"))
         self.wall_btn.clicked.connect(self._toggle_wall)
         self.reset_btn.clicked.connect(self._reset_view)
         self.elev_combo.currentIndexChanged.connect(self._combo_changed)
@@ -1072,6 +1232,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 color: #f1f5f9;
             }
             QPushButton:hover { border-color: #4ea1ff; }
+            QPushButton:checked {
+                border-color: #4ea1ff;
+                background: #17345a;
+                color: white;
+            }
             """
         )
 
@@ -1096,6 +1261,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.histories = snapshot["histories"]
         self.live_sequence = snapshot["live_sequence"]
         self.live_volume = snapshot["live_volume"]
+        self.strategy = snapshot.get("strategy", self.strategy)
+        self.scanning_scan = snapshot.get("scanning_scan")
+        self.live_complete = bool(snapshot.get("live_complete", False))
 
         elevations = sorted(self.histories)
         if not elevations:
@@ -1191,7 +1359,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _render_all(self):
         anchor = self._anchor_scan()
-        self.single.set_scan(anchor, self.live_volume)
+        anchor_history = self._history()
+        anchor_latest = bool(
+            anchor is not None
+            and anchor_history
+            and anchor.scan_id == anchor_history[0].scan_id
+        )
+        anchor_scanning = bool(
+            anchor is not None
+            and self.scanning_scan is not None
+            and abs(anchor.elevation - self.scanning_scan.elevation) <= 0.07
+        )
+        self.single.set_scan(
+            anchor,
+            self.live_volume,
+            is_latest=anchor_latest,
+            is_scanning=anchor_scanning,
+        )
         self.single.set_active(True)
 
         elevations = sorted(self.histories)[:16]
@@ -1199,7 +1383,22 @@ class MainWindow(QtWidgets.QMainWindow):
             if idx < len(elevations):
                 elevation = elevations[idx]
                 scan = self.wall_scans.get(elevation)
-                canvas.set_scan(scan, self.live_volume)
+                history = self.histories.get(elevation, [])
+                is_latest = bool(
+                    scan is not None
+                    and history
+                    and scan.scan_id == history[0].scan_id
+                )
+                is_scanning = bool(
+                    self.scanning_scan is not None
+                    and abs(elevation - self.scanning_scan.elevation) <= 0.07
+                )
+                canvas.set_scan(
+                    scan,
+                    self.live_volume,
+                    is_latest=is_latest,
+                    is_scanning=is_scanning,
+                )
                 canvas.set_active(
                     self.anchor_elevation is not None
                     and abs(elevation - self.anchor_elevation) <= 0.07
@@ -1210,8 +1409,39 @@ class MainWindow(QtWidgets.QMainWindow):
                 canvas.set_active(False)
                 canvas.setProperty("elevation", None)
 
+        self._update_strategy_labels()
         self._update_time_label()
+        self._refresh_age_labels()
         self.render_timer.start()
+
+    def _set_interaction_mode(self, mode: str):
+        self.interaction_mode = mode
+        self.pan_btn.setChecked(mode == "pan")
+        self.zoom_btn.setChecked(mode == "zoom")
+        for canvas in [self.single, *self.wall_canvases]:
+            canvas.set_interaction_mode(mode)
+
+    def _refresh_age_labels(self):
+        self.single.update_age_badge(self.live_volume)
+        for canvas in self.wall_canvases:
+            canvas.update_age_badge(self.live_volume)
+
+    def _update_strategy_labels(self):
+        scan_name = self.strategy.get("scan_name", "VCP ?")
+        dynamic = self.strategy.get("dynamic_scan_type", "standard")
+        self.strategy_label.setText(
+            f"{scan_name} · {dynamic}"
+            if dynamic and dynamic != "standard"
+            else str(scan_name)
+        )
+
+        if self.scanning_scan is not None and not self.live_complete:
+            self.prediction_label.setText(
+                f"SCANNING… {self.scanning_scan.label}"
+            )
+        else:
+            self.prediction_label.setText("")
+
 
     def _update_time_label(self):
         scan = self._anchor_scan()
