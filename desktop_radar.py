@@ -577,6 +577,8 @@ class RadarDataWorker(QtCore.QThread):
             "vcp_sequence_active": False,
         }
         self.live_complete = False
+        self.last_archive_extension: int | None = None
+        self.active_chunk_prefix: str | None = None
         self.site_lat: float | None = None
         self.site_lon: float | None = None
         self._boundaries_loaded = False
@@ -627,31 +629,27 @@ class RadarDataWorker(QtCore.QThread):
                 self.msleep(100)
 
     def _recent_archive_keys(self) -> list[str]:
-        """Find recent completed volumes without scanning a full radar day."""
+        """Return newest completed KMOB volumes from current/previous UTC day."""
         now = datetime.now(timezone.utc)
         found: dict[str, datetime] = {}
 
-        # Completed Level-II filenames begin with KMOBYYYYMMDD_HH, so querying
-        # only the last few UTC hours keeps startup listings tiny.
-        for hours_back in range(0, 5):
-            stamp = now - timedelta(hours=hours_back)
-            prefix = (
-                f"{stamp:%Y/%m/%d}/{RADAR_ID}/"
-                f"{RADAR_ID}{stamp:%Y%m%d_%H}"
-            )
-            response = self.archive_s3.list_objects_v2(
+        for day_offset in (0, 1):
+            stamp = now - timedelta(days=day_offset)
+            prefix = f"{stamp:%Y/%m/%d}/{RADAR_ID}/"
+            paginator = self.archive_s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
                 Bucket=ARCHIVE_BUCKET,
                 Prefix=prefix,
-                MaxKeys=1000,
-            )
-            for obj in response.get("Contents", []):
-                key = obj["Key"]
-                name = key.rsplit("/", 1)[-1]
-                if "_MDM" in name:
-                    continue
-                if "_V06" not in name and not name.endswith(".gz"):
-                    continue
-                found[key] = obj["LastModified"]
+                PaginationConfig={"PageSize": 1000},
+            ):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    name = key.rsplit("/", 1)[-1]
+                    if "_MDM" in name or not name.startswith(RADAR_ID):
+                        continue
+                    if "_V06" not in name and not name.endswith(".gz"):
+                        continue
+                    found[key] = obj["LastModified"]
 
             if len(found) >= ARCHIVE_VOLUMES:
                 break
@@ -661,7 +659,30 @@ class RadarDataWorker(QtCore.QThread):
             key=lambda item: item[1],
             reverse=True,
         )
-        return [key for key, _ in ordered[:ARCHIVE_VOLUMES]]
+        keys = [key for key, _ in ordered[:ARCHIVE_VOLUMES]]
+        print(
+            f"[ARCHIVE DISCOVERY] {len(keys)} recent {RADAR_ID} volumes",
+            flush=True,
+        )
+        for key in keys:
+            print(f"  {key}", flush=True)
+        return keys
+
+
+    def _volume_extension_from_file(self, path: Path) -> int | None:
+        """Read the three-digit Archive-II extension from the volume header."""
+        try:
+            with open(path, "rb") as handle:
+                header = handle.read(12)
+            if not header.startswith(b"AR2V") or len(header) < 12:
+                return None
+            raw = header[9:12].decode("ascii", errors="ignore")
+            value = int(raw)
+            if 1 <= value <= 999:
+                return value
+        except Exception:
+            pass
+        return None
 
 
     def _recent_tgftp_files(self) -> list[str]:
@@ -785,6 +806,10 @@ class RadarDataWorker(QtCore.QThread):
                 if not scans:
                     continue
 
+                extension = self._volume_extension_from_file(path)
+                if extension is not None:
+                    self.last_archive_extension = extension
+
                 if self.site_lat is None or self.site_lon is None:
                     try:
                         self.site_lat, self.site_lon = _tree_site_location(tree)
@@ -851,12 +876,18 @@ class RadarDataWorker(QtCore.QThread):
 
         if loaded_any:
             total_scans = sum(len(items) for items in self.histories.values())
+            print(
+                f"[HISTORY] ready · {total_scans} scans · "
+                f"extension={self.last_archive_extension}",
+                flush=True,
+            )
             self.status.emit(
                 f"History ready · {total_scans} scans · connecting live chunks…"
             )
             self._emit_snapshot()
             self._load_boundaries()
         else:
+            print("[HISTORY] no decoded history", flush=True)
             self.status.emit(
                 "No decoded history yet · waiting for live chunks…"
             )
@@ -894,7 +925,32 @@ class RadarDataWorker(QtCore.QThread):
             )
 
 
-    def _chunk_prefixes(self, limit: int = 5) -> list[str]:
+    @staticmethod
+    def _next_extension(value: int, step: int = 1) -> int:
+        return ((int(value) - 1 + step) % 999) + 1
+
+    def _candidate_chunk_prefixes(self) -> list[str]:
+        """Probe directories around the newest completed volume sequence.
+
+        The chunk directory is the three-digit Archive-II extension counter.
+        It increments every radar volume and wraps 999 -> 001.
+        """
+        prefixes: list[str] = []
+
+        if self.active_chunk_prefix:
+            prefixes.append(self.active_chunk_prefix)
+
+        if self.last_archive_extension is not None:
+            # Completed archive can lag live by several scans, so look ahead.
+            for step in range(0, 13):
+                ext = self._next_extension(self.last_archive_extension, step)
+                prefix = f"{RADAR_ID}/{ext:03d}/"
+                if prefix not in prefixes:
+                    prefixes.append(prefix)
+            return prefixes
+
+        # If no completed header was available, fall back to station-directory
+        # discovery. Probe every visible prefix once and rank by newest object.
         root = f"{RADAR_ID}/"
         response = self.chunk_s3.list_objects_v2(
             Bucket=CHUNK_BUCKET,
@@ -902,103 +958,66 @@ class RadarDataWorker(QtCore.QThread):
             Delimiter="/",
             MaxKeys=1000,
         )
-        prefixes = [item["Prefix"] for item in response.get("CommonPrefixes", [])]
-
-        def prefix_key(prefix: str):
-            leaf = prefix.rstrip("/").rsplit("/", 1)[-1]
-            try:
-                return int(leaf)
-            except ValueError:
-                return -1
-
-        prefixes.sort(key=prefix_key, reverse=True)
-        return prefixes[:limit]
-
-    def _chunk_objects(self, prefix: str) -> list[dict[str, Any]]:
-        response = self.chunk_s3.list_objects_v2(
-            Bucket=CHUNK_BUCKET,
-            Prefix=prefix,
-            MaxKeys=1000,
-        )
-        return response.get("Contents", [])
-
-    def _chunk_volume_candidates(
-        self,
-        objects: list[dict[str, Any]],
-    ) -> list[tuple[str, list[dict[str, Any]]]]:
-        """Group the rolling station directory into real radar volumes.
-
-        The numeric S3 directory can contain chunks from multiple volume
-        timestamps.  Xradar requires exactly one volume, with its S chunk
-        first, followed by that volume's I/E chunks in numeric order.
-        """
-        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-        for obj in objects:
-            name = obj["Key"].rsplit("/", 1)[-1]
-            match = re.match(
-                r"^(?P<volume>\d{8}-\d{6})-"
-                r"(?P<sequence>\d+)-(?P<kind>[SIE])$",
-                name,
-            )
-            if match is None:
-                continue
-
-            item = dict(obj)
-            item["_volume_id"] = match.group("volume")
-            item["_sequence"] = int(match.group("sequence"))
-            item["_kind"] = match.group("kind")
-            groups[item["_volume_id"]].append(item)
-
-        candidates: list[tuple[str, list[dict[str, Any]]]] = []
-        for volume_id, items in groups.items():
-            items.sort(key=lambda item: item["_sequence"])
-            if not items:
-                continue
-
-            s_positions = [
-                index
-                for index, item in enumerate(items)
-                if item["_kind"] == "S"
-            ]
-            if not s_positions:
-                continue
-
-            # Drop any stale I/E chunks that precede this volume's start chunk.
-            start = s_positions[0]
-            items = items[start:]
-            if not items or items[0]["_kind"] != "S":
-                continue
-            candidates.append((volume_id, items))
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates
+        for item in response.get("CommonPrefixes", []):
+            prefix = item["Prefix"]
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+        return prefixes
 
     def _refresh_live(self) -> bool:
-        prefixes = self._chunk_prefixes(limit=5)
+        prefixes = self._candidate_chunk_prefixes()
         if not prefixes:
+            self.status.emit("LIVE · no chunk directories discovered")
             return False
 
         all_candidates: list[
-            tuple[str, str, list[dict[str, Any]]]
+            tuple[datetime, str, str, list[dict[str, Any]]]
         ] = []
+
+        # The active prefix is cheap to poll every cycle. During discovery,
+        # inspect the look-ahead sequence directories and choose by object
+        # LastModified, never by numeric directory value.
         for prefix in prefixes:
             try:
                 objects = self._chunk_objects(prefix)
-            except Exception:
+            except Exception as exc:
                 continue
+
             for volume_id, volume_objects in self._chunk_volume_candidates(objects):
-                all_candidates.append((volume_id, prefix, volume_objects))
+                newest_modified = max(
+                    (obj.get("LastModified") for obj in volume_objects),
+                    default=datetime.min.replace(tzinfo=timezone.utc),
+                )
+                all_candidates.append(
+                    (newest_modified, volume_id, prefix, volume_objects)
+                )
+
+            # Once an active directory is producing a candidate, don't spend
+            # every 2-second poll walking twelve look-ahead directories.
+            if (
+                prefix == self.active_chunk_prefix
+                and any(item[2] == prefix for item in all_candidates)
+            ):
+                break
 
         if not all_candidates:
-            self.status.emit("LIVE · waiting for a volume-start S chunk…")
+            print(
+                "[LIVE DISCOVERY] no S-start volume in prefixes: "
+                + ", ".join(prefixes[:13]),
+                flush=True,
+            )
+            self.status.emit(
+                "LIVE · waiting for next volume-start S chunk · showing completed data"
+            )
             return False
 
-        # A valid volume timestamp is sortable as text (YYYYMMDD-HHMMSS).
         all_candidates.sort(key=lambda item: item[0], reverse=True)
 
-        for volume_id, prefix, volume_objects in all_candidates[:6]:
-            is_current = volume_id == self.current_live_volume
+        for modified, volume_id, prefix, volume_objects in all_candidates[:8]:
+            is_current = (
+                volume_id == self.current_live_volume
+                and prefix == self.active_chunk_prefix
+            )
             chunk_cache = self._chunk_bytes if is_current else {}
             changed = not is_current
 
@@ -1021,6 +1040,11 @@ class RadarDataWorker(QtCore.QThread):
 
             first_bytes = chunk_cache[ordered[0]["Key"]]
             if not first_bytes[:4].startswith(b"AR2V"):
+                print(
+                    f"[LIVE SKIP] {prefix}{volume_id}: "
+                    "S filename does not contain AR2V header",
+                    flush=True,
+                )
                 continue
 
             if not changed:
@@ -1032,18 +1056,30 @@ class RadarDataWorker(QtCore.QThread):
                     chunks,
                     incomplete_sweep="pad",
                 )
-            except (ValueError, EOFError, OSError):
+            except Exception as exc:
+                print(
+                    f"[LIVE DECODE WAIT] {prefix}{volume_id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
                 continue
 
             scans = _extract_scans(tree, volume_id, "live")
             if not scans:
-                # Keep completed/archive display until the new live volume has
-                # enough bytes to expose its first partial sweep.
                 continue
 
             self.current_live_volume = volume_id
+            self.active_chunk_prefix = prefix
             self._chunk_bytes = chunk_cache
             self.live_sequence = scans
+
+            # Keep extension tracking synchronized with the live directory.
+            try:
+                self.last_archive_extension = int(
+                    prefix.rstrip("/").rsplit("/", 1)[-1]
+                )
+            except Exception:
+                pass
 
             live_strategy = _scan_strategy(tree)
             if live_strategy.get("scan_name") != "VCP ?":
@@ -1056,14 +1092,24 @@ class RadarDataWorker(QtCore.QThread):
             self._merge_scans(scans)
 
             last = scans[-1]
+            print(
+                f"[LIVE] {prefix}{volume_id} · {len(chunks)} chunks · "
+                f"{last.label} · {last.completion:.0f}%",
+                flush=True,
+            )
             self.status.emit(
                 f"LIVE · {last.label} · {last.completion:.0f}% "
                 f"· {len(chunks)} chunks"
             )
+
+            # Once E arrives, clear active-prefix preference on the next poll so
+            # the immediately following extension directory is discovered.
+            if self.live_complete:
+                self.active_chunk_prefix = None
             return True
 
         self.status.emit(
-            "LIVE · no decodable S→I/E volume yet · showing completed data"
+            "LIVE · chunks found but no sweep decodable yet · showing completed data"
         )
         return False
 
