@@ -33,11 +33,19 @@ conda env create -f desktop_environment.yml
 conda activate kmob-radar-desktop
 ```
 
-Or install the desktop packages into the existing `kmob-radar` environment:
+Or install the desktop packages into the existing `kmob-radar` environment. On Windows, prefer Conda-forge for the complete Qt DLL stack:
 
 ```powershell
 conda activate kmob-radar
-conda install --override-channels -c conda-forge pyside6=6.11 pyqtgraph=0.14 numba -y
+python -m pip uninstall -y PySide6 PySide6_Addons PySide6_Essentials shiboken6 pyqtgraph
+conda install -n kmob-radar --solver=libmamba --override-channels -c conda-forge "pyside6>=6.10,<6.12" "pyqtgraph=0.14" numba -y
+```
+
+Verify Qt before launching:
+
+```powershell
+python -c "from PySide6 import QtCore, QtGui, QtWidgets; print('PySide6 OK:', QtCore.qVersion())"
+python -c "import PySide6; import pyqtgraph as pg; print('GUI stack OK:', pg.__version__)"
 ```
 
 Xradar 0.12+ is required for direct NEXRAD chunk ingestion.
