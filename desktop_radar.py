@@ -415,7 +415,6 @@ def render_scan(
 
     xmin, xmax = x_range
     ymin, ymax = y_range
-
     rr, az = _render_grid(
         (xmin, xmax),
         (ymin, ymax),
@@ -424,15 +423,8 @@ def render_scan(
     )
 
     ranges = scan.range_km
-    if ranges.size < 2:
+    if ranges.size < 2 or scan.azimuth.size < 2:
         return np.full((height, width), np.nan, dtype=np.float32)
-
-    gate = np.searchsorted(ranges, rr, side="left")
-    gate = np.clip(gate, 0, ranges.size - 1)
-
-    lower_gate = np.maximum(gate - 1, 0)
-    choose_lower = np.abs(rr - ranges[lower_gate]) < np.abs(rr - ranges[gate])
-    gate = np.where(choose_lower, lower_gate, gate)
 
     with _RENDER_CACHE_LOCK:
         cached_sort = _SCAN_SORT_CACHE.get(scan.scan_id)
@@ -443,33 +435,79 @@ def render_scan(
             _SCAN_SORT_CACHE[scan.scan_id] = (order, az_sorted)
     else:
         order, az_sorted = cached_sort
+
     data_sorted = scan.reflectivity[order]
 
-    az_ext = np.concatenate(
-        (
-            [az_sorted[-1] - 360.0],
-            az_sorted,
-            [az_sorted[0] + 360.0],
-        )
-    )
-    idx_ext = np.concatenate(
-        (
-            [len(az_sorted) - 1],
-            np.arange(len(az_sorted), dtype=np.int32),
-            [0],
-        )
+    # Fast NEXRAD path: operational sweeps normally have nearly uniform
+    # azimuth spacing (360/720 rays) and uniform range-gate spacing.  Direct
+    # arithmetic avoids multiple searchsorted passes over every output pixel.
+    az_steps = np.diff(az_sorted)
+    az_step = float(np.nanmedian(az_steps)) if az_steps.size else 0.0
+    range_steps = np.diff(ranges)
+    range_step = (
+        float(np.nanmedian(range_steps))
+        if range_steps.size
+        else 0.0
     )
 
-    hi = np.searchsorted(az_ext, az, side="left")
-    hi = np.clip(hi, 1, len(az_ext) - 1)
-    lo = hi - 1
-    choose_hi = np.abs(az - az_ext[hi]) < np.abs(az - az_ext[lo])
-    ray_sorted = np.where(choose_hi, idx_ext[hi], idx_ext[lo])
+    az_regular = (
+        az_step > 0.0
+        and np.nanmax(np.abs(az_steps - az_step)) <= max(0.08, az_step * 0.25)
+    )
+    range_regular = (
+        range_step > 0.0
+        and np.nanmax(np.abs(range_steps - range_step))
+        <= max(0.002, range_step * 0.02)
+    )
 
-    sampled = data_sorted[ray_sorted, gate]
-    sampled = np.asarray(sampled, dtype=np.float32)
+    if az_regular:
+        ray_sorted = np.rint(
+            (az - float(az_sorted[0])) / az_step
+        ).astype(np.int32)
+        ray_sorted %= az_sorted.size
+    else:
+        az_ext = np.concatenate(
+            (
+                [az_sorted[-1] - 360.0],
+                az_sorted,
+                [az_sorted[0] + 360.0],
+            )
+        )
+        idx_ext = np.concatenate(
+            (
+                [len(az_sorted) - 1],
+                np.arange(len(az_sorted), dtype=np.int32),
+                [0],
+            )
+        )
+        hi = np.searchsorted(az_ext, az, side="left")
+        hi = np.clip(hi, 1, len(az_ext) - 1)
+        lo = hi - 1
+        choose_hi = np.abs(az - az_ext[hi]) < np.abs(az - az_ext[lo])
+        ray_sorted = np.where(choose_hi, idx_ext[hi], idx_ext[lo])
+
+    if range_regular:
+        gate = np.rint(
+            (rr - float(ranges[0])) / range_step
+        ).astype(np.int32)
+        gate = np.clip(gate, 0, ranges.size - 1)
+    else:
+        gate = np.searchsorted(ranges, rr, side="left")
+        gate = np.clip(gate, 0, ranges.size - 1)
+        lower_gate = np.maximum(gate - 1, 0)
+        choose_lower = (
+            np.abs(rr - ranges[lower_gate])
+            < np.abs(rr - ranges[gate])
+        )
+        gate = np.where(choose_lower, lower_gate, gate)
+
+    sampled = np.asarray(
+        data_sorted[ray_sorted, gate],
+        dtype=np.float32,
+    )
     sampled[rr > ranges[-1]] = np.nan
     return np.ascontiguousarray(sampled)
+
 
 
 class RenderTaskSignals(QtCore.QObject):
@@ -777,68 +815,142 @@ class RadarDataWorker(QtCore.QThread):
             Prefix=prefix,
             MaxKeys=1000,
         )
-        objects = response.get("Contents", [])
+        return response.get("Contents", [])
 
-        def order(item):
-            name = item["Key"].rsplit("/", 1)[-1]
-            match = re.search(r"(\d+)-(?:S|I|E)$", name)
-            return int(match.group(1)) if match else 999999
+    def _chunk_volume_candidates(
+        self,
+        objects: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        """Group the rolling station directory into real radar volumes.
 
-        return sorted(objects, key=order)
+        The numeric S3 directory can contain chunks from multiple volume
+        timestamps.  Xradar requires exactly one volume, with its S chunk
+        first, followed by that volume's I/E chunks in numeric order.
+        """
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for obj in objects:
+            name = obj["Key"].rsplit("/", 1)[-1]
+            match = re.match(
+                r"^(?P<volume>\d{8}-\d{6})-"
+                r"(?P<sequence>\d+)-(?P<kind>[SIE])$",
+                name,
+            )
+            if match is None:
+                continue
+
+            item = dict(obj)
+            item["_volume_id"] = match.group("volume")
+            item["_sequence"] = int(match.group("sequence"))
+            item["_kind"] = match.group("kind")
+            groups[item["_volume_id"]].append(item)
+
+        candidates: list[tuple[str, list[dict[str, Any]]]] = []
+        for volume_id, items in groups.items():
+            items.sort(key=lambda item: item["_sequence"])
+            if not items:
+                continue
+
+            s_positions = [
+                index
+                for index, item in enumerate(items)
+                if item["_kind"] == "S"
+            ]
+            if not s_positions:
+                continue
+
+            # Drop any stale I/E chunks that precede this volume's start chunk.
+            start = s_positions[0]
+            items = items[start:]
+            if not items or items[0]["_kind"] != "S":
+                continue
+            candidates.append((volume_id, items))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates
 
     def _refresh_live(self) -> bool:
         prefix = self._latest_chunk_prefix()
         if not prefix:
             return False
 
-        if prefix != self.current_live_volume:
-            self.current_live_volume = prefix
-            self._chunk_bytes = {}
-            self.live_sequence = []
-            self.live_complete = False
-            self.status.emit(f"LIVE · new volume {prefix.rstrip('/').rsplit('/', 1)[-1]}")
-
         objects = self._chunk_objects(prefix)
-        if not objects:
+        candidates = self._chunk_volume_candidates(objects)
+        if not candidates:
+            self.status.emit("LIVE · waiting for a volume-start S chunk…")
             return False
 
-        changed = False
-        for obj in objects:
-            key = obj["Key"]
-            if key in self._chunk_bytes:
+        # Try newest usable volume first.  If it only has its S chunk and no
+        # sweep yet, keep the currently displayed volume until more arrives.
+        for volume_id, volume_objects in candidates[:3]:
+            is_current = volume_id == self.current_live_volume
+            chunk_cache = self._chunk_bytes if is_current else {}
+            changed = not is_current
+
+            for obj in volume_objects:
+                key = obj["Key"]
+                if key in chunk_cache:
+                    continue
+                chunk_cache[key] = self.chunk_s3.get_object(
+                    Bucket=CHUNK_BUCKET,
+                    Key=key,
+                )["Body"].read()
+                changed = True
+
+            ordered = [
+                obj
+                for obj in volume_objects
+                if obj["Key"] in chunk_cache
+            ]
+            if not ordered:
                 continue
-            self._chunk_bytes[key] = self.chunk_s3.get_object(
-                Bucket=CHUNK_BUCKET,
-                Key=key,
-            )["Body"].read()
-            changed = True
 
-        if not changed:
-            return False
+            # Defense in depth: the selected first object must actually carry
+            # the Archive-II volume header, not merely have an S filename.
+            first_bytes = chunk_cache[ordered[0]["Key"]]
+            if not first_bytes[:4].startswith(b"AR2V"):
+                continue
 
-        ordered_keys = [obj["Key"] for obj in objects if obj["Key"] in self._chunk_bytes]
-        chunks = [self._chunk_bytes[key] for key in ordered_keys]
-        tree = xd.io.open_nexradlevel2_datatree(
-            chunks,
-            incomplete_sweep="pad",
-        )
-        scans = _extract_scans(tree, prefix, "live")
-        self.live_sequence = scans
-        live_strategy = _scan_strategy(tree)
-        if live_strategy.get("scan_name") != "VCP ?":
-            self.strategy = live_strategy
-        self.live_complete = any(
-            re.search(r"-\d+-E$", obj["Key"].rsplit("/", 1)[-1])
-            for obj in objects
-        )
-        self._merge_scans(scans)
+            if not changed:
+                return False
 
-        last = scans[-1] if scans else None
-        if last:
-            self.status.emit(
-                f"LIVE · {last.label} · {last.completion:.0f}% · {len(chunks)} chunks"
+            chunks = [chunk_cache[obj["Key"]] for obj in ordered]
+            try:
+                tree = xd.io.open_nexradlevel2_datatree(
+                    chunks,
+                    incomplete_sweep="pad",
+                )
+            except ValueError:
+                continue
+
+            scans = _extract_scans(tree, volume_id, "live")
+            if not scans:
+                # New volume exists but no usable sweep yet.  Keep prior
+                # imagery rather than blanking/failing the live display.
+                continue
+
+            self.current_live_volume = volume_id
+            self._chunk_bytes = chunk_cache
+            self.live_sequence = scans
+
+            live_strategy = _scan_strategy(tree)
+            if live_strategy.get("scan_name") != "VCP ?":
+                self.strategy = live_strategy
+
+            self.live_complete = any(
+                obj["_kind"] == "E"
+                for obj in ordered
             )
-        return True
+            self._merge_scans(scans)
+
+            last = scans[-1]
+            self.status.emit(
+                f"LIVE · {last.label} · {last.completion:.0f}% "
+                f"· {len(chunks)} chunks"
+            )
+            return True
+
+        return False
 
     def _merge_scans(self, scans: list[RadarScan]):
         canonical_keys = list(self.histories.keys())
@@ -1030,18 +1142,28 @@ class RadarCanvas(QtWidgets.QWidget):
         stack.setStackingMode(QtWidgets.QStackedLayout.StackingMode.StackAll)
         stack.addWidget(self.plot)
 
-        overlay_widget = QtWidgets.QWidget()
-        overlay_widget.setLayout(overlay)
-        overlay_widget.setAttribute(
+        self.overlay_widget = QtWidgets.QWidget()
+        self.overlay_widget.setLayout(overlay)
+        self.overlay_widget.setAttribute(
             QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents,
             True,
         )
-        stack.addWidget(overlay_widget)
+        stack.addWidget(self.overlay_widget)
+        # In StackAll mode the current widget is raised above the others.
+        # Make the status overlay explicitly topmost so labels never sit
+        # behind the PlotWidget/OpenGL paint surface.
+        stack.setCurrentWidget(self.overlay_widget)
+        self.overlay_widget.raise_()
 
         self.view_box.activated.connect(lambda: self.activated.emit(self))
         self.view_box.sigRangeChanged.connect(
             lambda *_: self.range_changed.emit(self)
         )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "overlay_widget"):
+            self.overlay_widget.raise_()
 
     def set_boundaries(self, data: dict[str, tuple[np.ndarray, np.ndarray]]):
         county = data.get("county")
