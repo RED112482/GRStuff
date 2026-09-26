@@ -1003,7 +1003,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     canvas.rerender()
 
     def _view_changed(self, source: RadarCanvas):
-        if self._syncing_ranges or source.view_box._rerendering if hasattr(source.view_box, "_rerendering") else False:
+        if self._syncing_ranges:
             return
         x_range, y_range = source.visible_ranges()
         self._syncing_ranges = True
