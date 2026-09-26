@@ -145,3 +145,20 @@ tr:last-child td{border-bottom:0}
 .wall-tile.supp-current{border-color:#35d07f;box-shadow:inset 0 0 0 1px rgba(53,208,127,.38)}
 .wall-tag{position:absolute;left:6px;bottom:6px;z-index:2;padding:3px 5px;border-radius:5px;background:rgba(5,9,15,.84);font-size:8px;font-weight:700;letter-spacing:.04em;color:#ffcb7a}
 .wall-tile.supp-current .wall-tag{color:#bff7d5}
+
+
+/* Shared storm-interrogation navigation */
+.radar-stage,.wall-tile{touch-action:none;cursor:grab;user-select:none}
+.radar-stage.panning,.wall-tile.panning{cursor:grabbing}
+.radar-stage img,.boundary-overlay,.overlay,
+.wall-tile img,.wall-boundary{
+  will-change:transform;
+  backface-visibility:hidden;
+}
+.wall-tile img,.wall-boundary{pointer-events:none}
+.wall-tile .wall-label,.wall-tile .wall-progress,.wall-tile .wall-tag{pointer-events:none}
+.wall-tile.active{
+  border-color:var(--accent);
+  box-shadow:inset 0 0 0 2px rgba(78,161,255,.42);
+}
+#resetViewBtn:disabled{opacity:.4}
